@@ -1106,8 +1106,9 @@ class AIAgent:
         if (
             api_mode is None
             and self.api_mode == "chat_completions"
-            and self.provider != "copilot-acp"
+            and self.provider not in {"copilot-acp", "auggie-acp"}
             and not str(self.base_url or "").lower().startswith("acp://copilot")
+            and not str(self.base_url or "").lower().startswith("acp://auggie")
             and not str(self.base_url or "").lower().startswith("acp+tcp://")
             and not self._is_azure_openai_url()
             and (
@@ -1416,7 +1417,7 @@ class AIAgent:
                     client_kwargs = {"api_key": api_key, "base_url": base_url}
                 if _provider_timeout is not None:
                     client_kwargs["timeout"] = _provider_timeout
-                if self.provider == "copilot-acp":
+                if self.provider in {"copilot-acp", "auggie-acp"}:
                     client_kwargs["command"] = self.acp_command
                     client_kwargs["args"] = self.acp_args
                 effective_base = base_url
@@ -5455,13 +5456,18 @@ class AIAgent:
         client_kwargs = dict(client_kwargs)
         _validate_proxy_env_urls()
         _validate_base_url(client_kwargs.get("base_url"))
-        if self.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+        if (
+            self.provider in {"copilot-acp", "auggie-acp"}
+            or str(client_kwargs.get("base_url", "")).startswith("acp://copilot")
+            or str(client_kwargs.get("base_url", "")).startswith("acp://auggie")
+        ):
             from agent.copilot_acp_client import CopilotACPClient
 
             client = CopilotACPClient(**client_kwargs)
             logger.info(
-                "Copilot ACP client created (%s, shared=%s) %s",
+                "ACP client created (%s, provider=%s, shared=%s) %s",
                 reason,
+                self.provider,
                 shared,
                 self._client_log_context(),
             )
@@ -11117,8 +11123,9 @@ class AIAgent:
                     # stream.  Mirror the ACP exclusion used for Responses
                     # API upgrade (lines ~1083-1085).
                     elif (
-                        self.provider == "copilot-acp"
+                        self.provider in {"copilot-acp", "auggie-acp"}
                         or str(self.base_url or "").lower().startswith("acp://copilot")
+                        or str(self.base_url or "").lower().startswith("acp://auggie")
                         or str(self.base_url or "").lower().startswith("acp+tcp://")
                     ):
                         _use_streaming = False

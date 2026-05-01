@@ -84,6 +84,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="acp://copilot",
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "auggie-acp": HermesOverlay(
+        transport="codex_responses",
+        auth_type="external_process",
+        base_url_override="acp://auggie",
+        base_url_env_var="AUGGIE_ACP_BASE_URL",
+    ),
     "github-copilot": HermesOverlay(
         transport="openai_chat",
         extra_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN"),
@@ -269,6 +275,12 @@ ALIASES: Dict[str, str] = {
     "github": "github-copilot",
     "github-copilot-acp": "copilot-acp",
 
+    # auggie-acp (Augment CLI ACP backend)
+    "auggie": "auggie-acp",
+    "augment": "auggie-acp",
+    "augment-acp": "auggie-acp",
+    "auggie-cli": "auggie-acp",
+
     # vercel (models.dev ID for AI Gateway)
     "ai-gateway": "vercel",
     "aigateway": "vercel",
@@ -353,6 +365,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "nous": "Nous Portal",
     "openai-codex": "OpenAI Codex",
     "copilot-acp": "GitHub Copilot ACP",
+    "auggie-acp": "Auggie ACP",
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
     "gmi": "GMI Cloud",

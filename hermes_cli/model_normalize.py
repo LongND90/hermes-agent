@@ -80,6 +80,7 @@ _DOT_TO_HYPHEN_PROVIDERS: frozenset[str] = frozenset({
 _STRIP_VENDOR_ONLY_PROVIDERS: frozenset[str] = frozenset({
     "copilot",
     "copilot-acp",
+    "auggie-acp",
     "openai-codex",
 })
 
@@ -415,7 +416,7 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
     #     and live-catalog lookups.  Without this, vendor-prefixed or
     #     dash-notation Claude IDs survive to the Copilot API and hit
     #     HTTP 400 "model_not_supported".  See issue #6879.
-    if provider in {"copilot", "copilot-acp"}:
+    if provider in {"copilot", "copilot-acp", "auggie-acp"}:
         try:
             from hermes_cli.models import normalize_copilot_model_id
 

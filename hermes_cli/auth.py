@@ -83,6 +83,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_AUGGIE_ACP_BASE_URL = "acp://auggie"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -196,6 +197,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "auggie-acp": ProviderConfig(
+        id="auggie-acp",
+        name="Auggie ACP",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_AUGGIE_ACP_BASE_URL,
+        base_url_env_var="AUGGIE_ACP_BASE_URL",
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -1179,6 +1187,8 @@ def resolve_provider(
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
+        "auggie": "auggie-acp", "augment": "auggie-acp",
+        "augment-acp": "auggie-acp", "auggie-cli": "auggie-acp",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth", "google-gemini-cli": "google-gemini-cli", "gemini-cli": "google-gemini-cli", "gemini-oauth": "google-gemini-cli",
@@ -3443,19 +3453,53 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+# Per-provider env var defaults for external-process (ACP) backends.
+# Lookup keyed by provider_id avoids duplicating the env var dance for each
+# new ACP-backed provider (copilot-acp, auggie-acp, ...).
+_ACP_PROCESS_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "copilot-acp": {
+        "command_env": "HERMES_COPILOT_ACP_COMMAND",
+        "alt_env": "COPILOT_CLI_PATH",
+        "args_env": "HERMES_COPILOT_ACP_ARGS",
+        "default_command": "copilot",
+        "default_args": ["--acp", "--stdio"],
+    },
+    "auggie-acp": {
+        "command_env": "HERMES_AUGGIE_ACP_COMMAND",
+        "alt_env": "AUGGIE_CLI_PATH",
+        "args_env": "HERMES_AUGGIE_ACP_ARGS",
+        "default_command": "auggie",
+        "default_args": ["--acp"],
+    },
+}
+
+
+def _resolve_acp_process_command_args(provider_id: str) -> tuple[str, list[str]]:
+    """Resolve (command, args) for an external-process ACP provider via env vars."""
+    defaults = _ACP_PROCESS_DEFAULTS.get(provider_id, {})
+    command_env = defaults.get("command_env", "")
+    alt_env = defaults.get("alt_env", "")
+    args_env = defaults.get("args_env", "")
+    default_command = defaults.get("default_command", "")
+    default_args = list(defaults.get("default_args", []) or [])
+
+    command = (
+        (os.getenv(command_env, "").strip() if command_env else "")
+        or (os.getenv(alt_env, "").strip() if alt_env else "")
+        or default_command
+    )
+    raw_args = os.getenv(args_env, "").strip() if args_env else ""
+    args = shlex.split(raw_args) if raw_args else default_args
+    return command, args
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    command, args = _resolve_acp_process_command_args(provider_id)
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
@@ -3486,7 +3530,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "google-gemini-cli":
         return get_gemini_oauth_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", "auggie-acp"}:
         return get_external_process_provider_status(target)
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
@@ -3561,25 +3605,22 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    defaults = _ACP_PROCESS_DEFAULTS.get(provider_id, {})
+    command, args = _resolve_acp_process_command_args(provider_id)
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
+        command_env = defaults.get("command_env", "HERMES_COPILOT_ACP_COMMAND")
+        alt_env = defaults.get("alt_env", "COPILOT_CLI_PATH")
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            f"Could not find the {pconfig.name} CLI command '{command}'. "
+            f"Install it or set {command_env}/{alt_env}.",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code="missing_external_process_cli",
         )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": provider_id,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,

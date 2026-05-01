@@ -1813,6 +1813,8 @@ def select_provider_and_model(args=None):
         _model_flow_google_gemini_cli(config, current_model)
     elif selected_provider == "copilot-acp":
         _model_flow_copilot_acp(config, current_model)
+    elif selected_provider == "auggie-acp":
+        _model_flow_auggie_acp(config, current_model)
     elif selected_provider == "copilot":
         _model_flow_copilot(config, current_model)
     elif selected_provider == "custom":
@@ -3948,6 +3950,69 @@ def _model_flow_copilot_acp(config, current_model=""):
     deactivate_provider()
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
+
+
+def _model_flow_auggie_acp(config, current_model=""):
+    """Auggie ACP flow using the local Augment CLI (`auggie --acp`).
+
+    Simplified relative to the Copilot ACP flow: Auggie picks its own model
+    server-side, so there is no catalog fetch and no model picker. We always
+    save the placeholder model id ``auggie-acp``.
+    """
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _save_model_choice,
+        deactivate_provider,
+        get_external_process_provider_status,
+        resolve_external_process_provider_credentials,
+    )
+    from hermes_cli.config import load_config, save_config
+
+    del config, current_model
+
+    provider_id = "auggie-acp"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+
+    status = get_external_process_provider_status(provider_id)
+    resolved_command = (
+        status.get("resolved_command") or status.get("command") or "auggie"
+    )
+    effective_base = status.get("base_url") or pconfig.inference_base_url
+
+    print("  Auggie ACP delegates Hermes turns to `auggie --acp`.")
+    print("  Hermes starts an Auggie ACP subprocess for each request.")
+    print("  Auggie picks its own model server-side; Hermes does not select one.")
+    print(f"  Command: {resolved_command}")
+    print(f"  Backend marker: {effective_base}")
+    print()
+
+    try:
+        creds = resolve_external_process_provider_credentials(provider_id)
+    except Exception as exc:
+        print(f"  ⚠ {exc}")
+        print(
+            "  Set HERMES_AUGGIE_ACP_COMMAND or AUGGIE_CLI_PATH if Auggie CLI is installed elsewhere."
+        )
+        return
+
+    effective_base = creds.get("base_url") or effective_base
+
+    selected = "auggie-acp"
+    _save_model_choice(selected)
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = effective_base
+    model["api_mode"] = "chat_completions"
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {selected} (via {pconfig.name})")
+
 
 
 def _model_flow_kimi(config, current_model=""):
