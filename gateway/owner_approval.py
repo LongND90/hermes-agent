@@ -117,13 +117,21 @@ class OwnerApprovalRateLimiter:
             denied = self._load(self._denied_path())
             return str(user_id) in denied
 
-    def block(self, user_id: str, blocked_by: Optional[str] = None) -> None:
+    def block(
+        self,
+        user_id: str,
+        blocked_by: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> None:
         with self._lock:
             denied = self._load(self._denied_path())
-            denied[str(user_id)] = {
+            entry: Dict[str, Any] = {
                 "blocked_at": time.time(),
                 "blocked_by_owner_id": str(blocked_by) if blocked_by else None,
             }
+            if name:
+                entry["user_name"] = str(name)
+            denied[str(user_id)] = entry
             self._save(self._denied_path(), denied)
             # Clear any deny counter for this user once they're blocked.
             state = self._load(self._state_path())
@@ -205,3 +213,58 @@ class OwnerApprovalRateLimiter:
             state = self._load(self._state_path())
             if state.pop(f"deny:{user_id}", None) is not None:
                 self._save(self._state_path(), state)
+
+    # --- Pending owner-approval users (between notify and inline-button click) ---
+
+    _PENDING_TTL_SECONDS = 7 * 24 * 3600
+
+    def _pending_users_path(self) -> Path:
+        return PAIRING_DIR / "_owner_pending_users.json"
+
+    def _cleanup_pending(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        now = time.time()
+        keep: Dict[str, Any] = {}
+        for uid, info in (data or {}).items():
+            if not isinstance(info, dict):
+                continue
+            ts = float(info.get("last_seen_at", 0) or 0)
+            if (now - ts) <= self._PENDING_TTL_SECONDS:
+                keep[str(uid)] = info
+        return keep
+
+    def record_pending_user(
+        self,
+        user_id: str,
+        user_name: Optional[str] = None,
+        username: Optional[str] = None,
+        message_preview: Optional[str] = None,
+    ) -> None:
+        """Persist user metadata seen in an owner-approval prompt.
+
+        Idempotent: re-recording the same user updates name/username so a
+        rename between two prompts is reflected on approval. Entries older
+        than ``_PENDING_TTL_SECONDS`` are dropped on every write.
+        """
+        with self._lock:
+            data = self._cleanup_pending(self._load(self._pending_users_path()))
+            data[str(user_id)] = {
+                "user_id": str(user_id),
+                "user_name": (user_name or "").strip() or None,
+                "username": (username or "").lstrip("@").strip() or None,
+                "message_preview": (message_preview or "")[:200] or None,
+                "last_seen_at": time.time(),
+            }
+            self._save(self._pending_users_path(), data)
+
+    def get_pending_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            data = self._load(self._pending_users_path())
+        entry = data.get(str(user_id)) if isinstance(data, dict) else None
+        return entry if isinstance(entry, dict) else None
+
+    def clear_pending_user(self, user_id: str) -> None:
+        with self._lock:
+            data = self._load(self._pending_users_path())
+            if isinstance(data, dict) and str(user_id) in data:
+                data.pop(str(user_id), None)
+                self._save(self._pending_users_path(), data)

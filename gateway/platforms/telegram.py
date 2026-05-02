@@ -293,6 +293,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # current process. Persistent allow → pairing store; persistent block →
         # OwnerApprovalRateLimiter denylist file.
         self._session_allowed_users: set = set()
+        # Most-recently-seen user metadata (full_name, username) keyed by
+        # user_id. Populated by ``_build_message_event`` so that the
+        # owner-approval prompt can persist real names/usernames before the
+        # owner clicks Allow/Block. Capped to avoid unbounded growth.
+        self._recent_user_info: Dict[str, Dict[str, str]] = {}
+        self._recent_user_info_max: int = 500
 
     def _is_callback_user_authorized(
         self,
@@ -351,6 +357,54 @@ class TelegramAdapter(BasePlatformAdapter):
         if not user_id:
             return False
         return str(user_id) in self._session_allowed_users
+
+    def _cache_user_info(self, user) -> None:
+        """Remember per-user metadata seen on the latest update."""
+        try:
+            uid = str(user.id)
+        except Exception:
+            return
+        cache = getattr(self, "_recent_user_info", None)
+        if cache is None:
+            cache = {}
+            self._recent_user_info = cache
+            self._recent_user_info_max = getattr(self, "_recent_user_info_max", 500)
+        info: Dict[str, str] = {
+            "first_name": (getattr(user, "first_name", "") or "").strip(),
+            "last_name": (getattr(user, "last_name", "") or "").strip(),
+            "username": (getattr(user, "username", "") or "").strip(),
+            "full_name": (getattr(user, "full_name", "") or "").strip(),
+        }
+        if uid in cache:
+            cache.pop(uid, None)
+        elif len(cache) >= self._recent_user_info_max:
+            try:
+                oldest = next(iter(cache))
+                cache.pop(oldest, None)
+            except StopIteration:
+                pass
+        cache[uid] = info
+
+    @staticmethod
+    def _build_user_display_name(entry: Dict[str, Any]) -> str:
+        """Best-effort human label from a pending-user entry or cache record."""
+        if not isinstance(entry, dict):
+            return ""
+        full = (entry.get("user_name") or entry.get("full_name") or "").strip()
+        if not full:
+            fn = (entry.get("first_name") or "").strip()
+            ln = (entry.get("last_name") or "").strip()
+            full = f"{fn} {ln}".strip()
+        un = (entry.get("username") or "").lstrip("@").strip()
+        parts: list = []
+        if full:
+            parts.append(full)
+        if un:
+            parts.append(f"@{un}")
+        if parts:
+            return " ".join(parts)
+        uid = entry.get("user_id")
+        return f"user_{uid}" if uid else ""
 
     def _resolve_owner_chat_id(self) -> Optional[int]:
         """Look up the configured owner_chat_id for owner-approval flows."""
@@ -1584,9 +1638,24 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             preview = (message_preview or "")[:200]
-            display_name = _html.escape(user_name or "(no name)")
-            display_username = _html.escape(f"@{username}") if username else "—"
             uid_str = str(user_id)
+            cached = (getattr(self, "_recent_user_info", None) or {}).get(uid_str) or {}
+            effective_user_name = (user_name or "").strip() or cached.get("full_name", "") or (
+                f"{cached.get('first_name', '')} {cached.get('last_name', '')}".strip()
+            )
+            effective_username = (username or "").lstrip("@").strip() or cached.get("username", "")
+            try:
+                from gateway.owner_approval import OwnerApprovalRateLimiter
+                OwnerApprovalRateLimiter("telegram").record_pending_user(
+                    user_id=uid_str,
+                    user_name=effective_user_name,
+                    username=effective_username,
+                    message_preview=preview,
+                )
+            except Exception as exc:
+                logger.debug("[%s] record_pending_user failed: %s", self.name, exc)
+            display_name = _html.escape(effective_user_name or "(no name)")
+            display_username = _html.escape(f"@{effective_username}") if effective_username else "—"
             uid_safe = _html.escape(uid_str)
             preview_safe = _html.escape(preview) if preview else "(empty)"
             text = (
@@ -1948,6 +2017,24 @@ class TelegramAdapter(BasePlatformAdapter):
         from datetime import datetime
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        pending_entry: Dict[str, Any] = {}
+        if limiter is not None:
+            try:
+                pending_entry = limiter.get_pending_user(target_uid) or {}
+            except Exception:
+                pending_entry = {}
+        if not pending_entry:
+            cached = (getattr(self, "_recent_user_info", None) or {}).get(str(target_uid)) or {}
+            if cached:
+                pending_entry = {
+                    "user_id": str(target_uid),
+                    "user_name": cached.get("full_name", ""),
+                    "username": cached.get("username", ""),
+                }
+        display_name = self._build_user_display_name(
+            {**pending_entry, "user_id": pending_entry.get("user_id") or str(target_uid)}
+        )
+
         if action == "a":  # Allow forever
             try:
                 runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
@@ -1955,14 +2042,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 if pairing_store is not None:
                     with pairing_store._lock:
                         pairing_store._approve_user(
-                            "telegram", str(target_uid),
-                            "approved by owner via inline button",
+                            "telegram", str(target_uid), display_name,
                         )
                 if limiter is not None:
                     limiter.reset_deny(target_uid)
                 # Drop any prior block on this user
                 if limiter is not None:
                     limiter.unblock(target_uid)
+                    try:
+                        limiter.clear_pending_user(target_uid)
+                    except Exception:
+                        pass
                 self._session_allowed_users.discard(str(target_uid))
                 await query.answer(text="✅ Approved")
                 try:
@@ -1999,7 +2089,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 and count >= limiter.auto_block_after_deny
             )
             if auto_block:
-                limiter.block(target_uid, blocked_by=str(owner_chat_id))
+                limiter.block(target_uid, blocked_by=str(owner_chat_id), name=display_name or None)
                 msg = (
                     f"❌ Denied (auto-blocked after {count} denies) "
                     f"<code>{_html.escape(str(target_uid))}</code> at {ts}"
@@ -2018,7 +2108,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if action == "b":  # Block forever
             if limiter is not None:
-                limiter.block(target_uid, blocked_by=str(owner_chat_id))
+                limiter.block(target_uid, blocked_by=str(owner_chat_id), name=display_name or None)
+                try:
+                    limiter.clear_pending_user(target_uid)
+                except Exception:
+                    pass
             self._session_allowed_users.discard(str(target_uid))
             await query.answer(text="🔇 Blocked")
             try:
@@ -2089,17 +2183,32 @@ class TelegramAdapter(BasePlatformAdapter):
         rows: list = []
         for kind, entry in slice_items:
             uid = str(entry.get("user_id") or "")
+            raw_name = (entry.get("user_name") or "").strip()
+            # Filter out the legacy placeholder text written by the old
+            # owner-approval inline-button handler so the menu renders cleanly.
+            if raw_name.lower().startswith("approved by owner"):
+                raw_name = ""
             if kind == "approved":
-                name = entry.get("user_name") or "(no name)"
-                lines.append(f"👤 {_html.escape(name)} — <code>{_html.escape(uid)}</code>")
-                label = name if name and name != "(no name)" else uid
+                if raw_name:
+                    lines.append(
+                        f"👤 {_html.escape(raw_name)} — <code>{_html.escape(uid)}</code>"
+                    )
+                else:
+                    lines.append(f"👤 — <code>{_html.escape(uid)}</code>")
+                short_label = (raw_name.split(" @", 1)[0].strip() or uid)[:30]
                 rows.append([InlineKeyboardButton(
-                    f"🗑 Revoke {label}"[:64], callback_data=f"pm:rev:{uid}"
+                    f"🗑 Revoke {short_label}"[:64], callback_data=f"pm:rev:{uid}"
                 )])
             else:
-                lines.append(f"🚫 <code>{_html.escape(uid)}</code>")
+                if raw_name:
+                    lines.append(
+                        f"🚫 {_html.escape(raw_name)} — <code>{_html.escape(uid)}</code>"
+                    )
+                else:
+                    lines.append(f"🚫 <code>{_html.escape(uid)}</code>")
+                short_label = (raw_name.split(" @", 1)[0].strip() or uid)[:30]
                 rows.append([InlineKeyboardButton(
-                    f"♻️ Unblock {uid}"[:64], callback_data=f"pm:unb:{uid}"
+                    f"♻️ Unblock {short_label}"[:64], callback_data=f"pm:unb:{uid}"
                 )])
         if not slice_items:
             lines.append("<i>(no users)</i>")
@@ -3835,7 +3944,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         chat = message.chat
         user = message.from_user
-        
+
+        # Cache user metadata so the owner-approval flow can later persist
+        # the real first/last/@username when Allow/Block is clicked.
+        if user is not None:
+            self._cache_user_info(user)
+
         # Determine chat type
         chat_type = "dm"
         if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
