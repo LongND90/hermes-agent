@@ -1048,6 +1048,26 @@ class TelegramAdapter(BasePlatformAdapter):
                         "[%s] Telegram menu: %d commands registered, %d hidden (over 100 limit). Use /commands for full list.",
                         self.name, len(menu_commands), hidden_count,
                     )
+                # Owner-scoped menu: append /users for the configured owner so
+                # Telegram only shows it in the owner's command popup. Telegram
+                # caps at 100 commands per scope; reserve one slot for /users
+                # by truncating the global list to 99 entries.
+                owner_chat_id = self._resolve_owner_chat_id()
+                if owner_chat_id is not None:
+                    try:
+                        from telegram import BotCommandScopeChat
+                        owner_menu = list(menu_commands)[:99] + [
+                            ("users", "🛡️ Quản lý whitelist (owner only)"),
+                        ]
+                        await self._bot.set_my_commands(
+                            [BotCommand(name, desc) for name, desc in owner_menu],
+                            scope=BotCommandScopeChat(chat_id=owner_chat_id),
+                        )
+                    except Exception as scope_err:
+                        logger.warning(
+                            "[%s] Could not register owner-scoped /users menu: %s",
+                            self.name, scope_err,
+                        )
             except Exception as e:
                 logger.warning(
                     "[%s] Could not register Telegram command menu: %s",
@@ -2013,6 +2033,178 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await query.answer(text="Unknown action.")
 
+    # ------------------------------------------------------------------
+    # Pairing manager (/users) — owner-only whitelist + denylist UI
+    # ------------------------------------------------------------------
+
+    _PM_PAGE_SIZE = 20
+
+    def _is_owner_caller(self, caller_id: Any) -> bool:
+        """Compare a Telegram user.id against the configured owner_chat_id."""
+        owner_chat_id = self._resolve_owner_chat_id()
+        if owner_chat_id is None or caller_id is None:
+            return False
+        try:
+            return int(caller_id) == int(owner_chat_id)
+        except (TypeError, ValueError):
+            return False
+
+    def _load_pairing_manager_data(self) -> tuple[list, list]:
+        """Return (approved_telegram_users, blocked_telegram_users)."""
+        approved: list = []
+        blocked: list = []
+        try:
+            from gateway.pairing import PairingStore
+            approved = PairingStore().list_approved("telegram") or []
+        except Exception as exc:
+            logger.warning("[%s] pairing store load failed: %s", self.name, exc)
+        try:
+            from gateway.owner_approval import OwnerApprovalRateLimiter
+            blocked = OwnerApprovalRateLimiter("telegram").list_blocked() or []
+        except Exception as exc:
+            logger.warning("[%s] owner-approval limiter load failed: %s", self.name, exc)
+        approved.sort(key=lambda e: float(e.get("approved_at") or 0), reverse=True)
+        blocked.sort(key=lambda e: float(e.get("blocked_at") or 0), reverse=True)
+        return approved, blocked
+
+    def _render_pairing_manager(
+        self, approved: list, blocked: list, page: int
+    ) -> tuple[str, "InlineKeyboardMarkup"]:
+        """Render the pairing manager menu for ``page`` (0-indexed)."""
+        items: list[tuple[str, dict]] = (
+            [("approved", e) for e in approved] + [("blocked", e) for e in blocked]
+        )
+        total = len(items)
+        page_size = self._PM_PAGE_SIZE
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        start, end = page * page_size, page * page_size + page_size
+        slice_items = items[start:end]
+
+        lines = [
+            "🛡️ <b>Pairing Manager</b>",
+            f"✅ Approved: {len(approved)}   🚫 Blocked: {len(blocked)}",
+            "",
+        ]
+        rows: list = []
+        for kind, entry in slice_items:
+            uid = str(entry.get("user_id") or "")
+            if kind == "approved":
+                name = entry.get("user_name") or "(no name)"
+                lines.append(f"👤 {_html.escape(name)} — <code>{_html.escape(uid)}</code>")
+                label = name if name and name != "(no name)" else uid
+                rows.append([InlineKeyboardButton(
+                    f"🗑 Revoke {label}"[:64], callback_data=f"pm:rev:{uid}"
+                )])
+            else:
+                lines.append(f"🚫 <code>{_html.escape(uid)}</code>")
+                rows.append([InlineKeyboardButton(
+                    f"♻️ Unblock {uid}"[:64], callback_data=f"pm:unb:{uid}"
+                )])
+        if not slice_items:
+            lines.append("<i>(no users)</i>")
+
+        if total_pages > 1:
+            nav: list = []
+            prev_page = (page - 1) % total_pages
+            next_page = (page + 1) % total_pages
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"pm:page:{prev_page}"))
+            nav.append(InlineKeyboardButton(
+                f"Page {page + 1}/{total_pages}", callback_data="pm:noop"
+            ))
+            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"pm:page:{next_page}"))
+            rows.append(nav)
+        rows.append([
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"pm:refresh:{page}"),
+            InlineKeyboardButton("✖ Close", callback_data="pm:close"),
+        ])
+        return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+    async def _send_pairing_manager_menu(self, chat_id: int, page: int = 0) -> None:
+        """Send a fresh pairing manager menu to ``chat_id``."""
+        approved, blocked = self._load_pairing_manager_data()
+        text, keyboard = self._render_pairing_manager(approved, blocked, page)
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as exc:
+            logger.warning("[%s] /users send failed: %s", self.name, exc)
+
+    async def _refresh_pairing_manager_message(self, query, page: int) -> None:
+        """Re-render the menu in-place for refresh / page / mutate actions."""
+        approved, blocked = self._load_pairing_manager_data()
+        text, keyboard = self._render_pairing_manager(approved, blocked, page)
+        try:
+            await query.edit_message_text(
+                text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+            )
+        except Exception as exc:
+            # Telegram raises BadRequest when content is identical — silent on that.
+            logger.debug("[%s] /users refresh edit failed: %s", self.name, exc)
+
+    async def _handle_pairing_manager_callback(self, query, data: str) -> None:
+        """Dispatch ``pm:`` inline-button actions (owner-only)."""
+        caller_id = getattr(query.from_user, "id", None)
+        if not self._is_owner_caller(caller_id):
+            await query.answer(text="⛔ Unauthorized", show_alert=True)
+            return
+        parts = data.split(":", 2)
+        action = parts[1] if len(parts) >= 2 else ""
+        arg = parts[2] if len(parts) >= 3 else ""
+
+        if action == "noop":
+            await query.answer()
+            return
+        if action == "close":
+            await query.answer(text="Đóng menu.")
+            try:
+                await query.edit_message_text(text="🛡️ Pairing Manager — đã đóng.", reply_markup=None)
+            except Exception:
+                pass
+            return
+        if action == "page":
+            try:
+                page = int(arg)
+            except ValueError:
+                page = 0
+            await query.answer()
+            await self._refresh_pairing_manager_message(query, page)
+            return
+        if action == "refresh":
+            try:
+                page = int(arg)
+            except ValueError:
+                page = 0
+            await query.answer(text="🔄 Refreshed")
+            await self._refresh_pairing_manager_message(query, page)
+            return
+        if action == "rev" and arg:
+            try:
+                from gateway.pairing import PairingStore
+                removed = PairingStore().revoke("telegram", arg)
+            except Exception as exc:
+                logger.warning("[%s] revoke failed for %s: %s", self.name, arg, exc)
+                removed = False
+            await query.answer(text="🗑 Revoked" if removed else "Not in whitelist")
+            await self._refresh_pairing_manager_message(query, 0)
+            return
+        if action == "unb" and arg:
+            try:
+                from gateway.owner_approval import OwnerApprovalRateLimiter
+                ok = OwnerApprovalRateLimiter("telegram").unblock(arg)
+            except Exception as exc:
+                logger.warning("[%s] unblock failed for %s: %s", self.name, arg, exc)
+                ok = False
+            await query.answer(text="♻️ Unblocked" if ok else "Not in denylist")
+            await self._refresh_pairing_manager_message(query, 0)
+            return
+        await query.answer(text="Unknown action.")
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -2038,6 +2230,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # --- Owner-approval callbacks (pa:action:user_id) ---
         if data.startswith("pa:"):
             await self._handle_owner_approval_callback(query, data)
+            return
+
+        # --- Pairing manager callbacks (pm:action[:arg]) ---
+        if data.startswith("pm:"):
+            await self._handle_pairing_manager_callback(query, data)
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
@@ -3047,9 +3244,26 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         if not update.message or not update.message.text:
             return
+
+        # /users — owner-only pairing manager. Intercept before the regular
+        # auth gate so the owner can always reach it; non-owners get silent
+        # ignore (no reply, no log noise) per design.
+        text = (update.message.text or "").strip()
+        first = text.split(maxsplit=1)[0] if text else ""
+        first = first.split("@", 1)[0].lower()
+        if first == "/users":
+            caller_id = getattr(update.effective_user, "id", None)
+            if not self._is_owner_caller(caller_id):
+                return
+            chat_id = getattr(update.message, "chat_id", None) or caller_id
+            if chat_id is None:
+                return
+            await self._send_pairing_manager_menu(int(chat_id), page=0)
+            return
+
         if not self._should_process_message(update.message, is_command=True):
             return
-        
+
         event = self._build_message_event(update.message, MessageType.COMMAND, update_id=update.update_id)
         await self.handle_message(event)
 
