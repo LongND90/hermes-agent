@@ -9101,6 +9101,11 @@ Examples:
 
     pairing_sub.add_parser("clear-pending", help="Clear all pending codes")
 
+    pairing_sub.add_parser(
+        "menu",
+        help="Interactive curses menu to revoke approved or unblock denied users",
+    )
+
     def cmd_pairing(args):
         from hermes_cli.pairing import pairing_command
 

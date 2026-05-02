@@ -139,6 +139,18 @@ class OwnerApprovalRateLimiter:
                 return True
         return False
 
+    def list_blocked(self) -> list:
+        """Return blocked users for this platform as a list of dicts."""
+        with self._lock:
+            denied = self._load(self._denied_path())
+        results = []
+        for uid, info in denied.items():
+            entry = {"platform": self.platform, "user_id": str(uid)}
+            if isinstance(info, dict):
+                entry.update(info)
+            results.append(entry)
+        return results
+
     # --- Notification rate limit ---
 
     def should_notify(self, user_id: str) -> bool:
