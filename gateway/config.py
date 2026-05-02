@@ -60,7 +60,7 @@ def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> st
     """Normalize unauthorized DM behavior to a supported value."""
     if isinstance(value, str):
         normalized = value.strip().lower()
-        if normalized in {"pair", "ignore"}:
+        if normalized in {"pair", "ignore", "notify_owner"}:
             return normalized
     return default
 
@@ -405,7 +405,7 @@ class GatewayConfig:
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
 
     # Unauthorized DM policy
-    unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
+    unauthorized_dm_behavior: str = "pair"  # "pair", "ignore", or "notify_owner"
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
@@ -665,9 +665,21 @@ def load_gateway_config() -> GatewayConfig:
             if "always_log_local" in yaml_cfg:
                 gw_data["always_log_local"] = yaml_cfg["always_log_local"]
 
+            # Allow `unauthorized_dm_behavior` either at YAML root (legacy)
+            # or under a `gateway:` block (preferred — namespaced for the
+            # gateway runner). Root-level wins when both are set so existing
+            # configs keep working.
+            gateway_block = yaml_cfg.get("gateway")
+            if not isinstance(gateway_block, dict):
+                gateway_block = {}
             if "unauthorized_dm_behavior" in yaml_cfg:
                 gw_data["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(
                     yaml_cfg.get("unauthorized_dm_behavior"),
+                    "pair",
+                )
+            elif "unauthorized_dm_behavior" in gateway_block:
+                gw_data["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(
+                    gateway_block.get("unauthorized_dm_behavior"),
                     "pair",
                 )
 

@@ -4134,6 +4134,33 @@ class GatewayRunner:
 
         # Check pairing store (always checked, regardless of allowlists)
         platform_name = source.platform.value if source.platform else ""
+
+        # Owner-approval denylist takes precedence over every other check
+        # below — once the owner has explicitly blocked a user via the
+        # inline-button flow, they must not be re-authorized by any other
+        # path. Currently scoped to Telegram which is the only platform
+        # wired into "notify_owner" mode.
+        if source.platform == Platform.TELEGRAM:
+            try:
+                from gateway.owner_approval import OwnerApprovalRateLimiter
+                if not hasattr(self, "_owner_approval_limiter"):
+                    self._owner_approval_limiter = OwnerApprovalRateLimiter("telegram")
+                if self._owner_approval_limiter.is_blocked(user_id):
+                    return False
+            except Exception as exc:
+                logger.debug("owner-approval denylist check failed: %s", exc)
+
+            # Once-mode allow set lives on the adapter (in-memory, per-process).
+            adapters = getattr(self, "adapters", None) or {}
+            adapter = adapters.get(source.platform)
+            session_allowed_fn = getattr(adapter, "is_session_allowed", None)
+            if callable(session_allowed_fn):
+                try:
+                    if session_allowed_fn(user_id):
+                        return True
+                except Exception as exc:
+                    logger.debug("owner-approval session-allow check failed: %s", exc)
+
         if self.pairing_store.is_approved(platform_name, user_id):
             return True
 
@@ -4294,6 +4321,40 @@ class GatewayRunner:
 
         return "pair"
 
+    async def _dispatch_owner_approval_request(
+        self, source: "SessionSource", event: "MessageEvent"
+    ) -> None:
+        """Notify the bot owner about an unauthorized DM with inline approval buttons.
+
+        No-op (and silent) when:
+          - adapter does not implement ``send_owner_approval_request``
+          - the rate limiter rejects (cooldown / global cap / denylist).
+        """
+        adapter = self.adapters.get(source.platform)
+        send_fn = getattr(adapter, "send_owner_approval_request", None)
+        if not callable(send_fn):
+            return
+        try:
+            from gateway.owner_approval import OwnerApprovalRateLimiter
+            if not hasattr(self, "_owner_approval_limiter"):
+                self._owner_approval_limiter = OwnerApprovalRateLimiter(
+                    source.platform.value if source.platform else "telegram"
+                )
+            limiter = self._owner_approval_limiter
+            if not limiter.should_notify(source.user_id):
+                return
+            preview = (event.text or "")[:200]
+            username = getattr(source, "username", None)
+            await send_fn(
+                user_id=str(source.user_id),
+                user_name=source.user_name or "",
+                username=username,
+                message_preview=preview,
+            )
+            limiter.record_notification(source.user_id)
+        except Exception as exc:
+            logger.warning("owner-approval dispatch failed: %s", exc)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -4386,8 +4447,9 @@ class GatewayRunner:
             return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            dm_behavior = self._get_unauthorized_dm_behavior(source.platform)
             # In DMs: offer pairing code. In groups: silently ignore.
-            if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
+            if source.chat_type == "dm" and dm_behavior == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
@@ -4417,6 +4479,11 @@ class GatewayRunner:
                         )
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
+            elif source.chat_type == "dm" and dm_behavior == "notify_owner":
+                # Owner-approval mode: drop the user message (zero outbound to
+                # the unknown sender) and forward an inline-button approval
+                # prompt to the bot owner. Currently wired for Telegram only.
+                await self._dispatch_owner_approval_request(source, event)
             return None
         
         # Intercept messages that are responses to a pending /update prompt.

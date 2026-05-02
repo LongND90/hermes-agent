@@ -289,6 +289,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
+        # Owner-approval (notify_owner mode) — in-memory once-allowlist for the
+        # current process. Persistent allow → pairing store; persistent block →
+        # OwnerApprovalRateLimiter denylist file.
+        self._session_allowed_users: set = set()
 
     def _is_callback_user_authorized(
         self,
@@ -337,6 +341,31 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
+
+    def is_session_allowed(self, user_id: str) -> bool:
+        """Return whether ``user_id`` was approved via the once-allow button.
+
+        Once-mode entries live only in-memory; they are cleared on adapter
+        restart. Persistent approvals go through the pairing store.
+        """
+        if not user_id:
+            return False
+        return str(user_id) in self._session_allowed_users
+
+    def _resolve_owner_chat_id(self) -> Optional[int]:
+        """Look up the configured owner_chat_id for owner-approval flows."""
+        candidate = None
+        extra = getattr(self.config, "extra", {}) or {}
+        if "owner_chat_id" in extra:
+            candidate = extra.get("owner_chat_id")
+        if candidate in (None, ""):
+            candidate = os.getenv("TELEGRAM_OWNER_CHAT_ID", "").strip() or None
+        if candidate in (None, ""):
+            return None
+        try:
+            return int(candidate)
+        except (TypeError, ValueError):
+            return None
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1513,6 +1542,61 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_owner_approval_request(
+        self,
+        user_id: str,
+        user_name: str,
+        username: Optional[str],
+        message_preview: str,
+    ) -> SendResult:
+        """Forward an unauthorized DM to the bot owner with inline approval buttons.
+
+        Callbacks are routed via ``_handle_callback_query`` under the ``pa:``
+        prefix. The original sender receives no outbound message — owner
+        approval is purely server-side state mutation.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        owner_chat_id = self._resolve_owner_chat_id()
+        if owner_chat_id is None:
+            logger.warning("[%s] notify_owner mode active but owner_chat_id is not configured", self.name)
+            return SendResult(success=False, error="owner_chat_id not configured")
+
+        try:
+            preview = (message_preview or "")[:200]
+            display_name = _html.escape(user_name or "(no name)")
+            display_username = _html.escape(f"@{username}") if username else "—"
+            uid_str = str(user_id)
+            uid_safe = _html.escape(uid_str)
+            preview_safe = _html.escape(preview) if preview else "(empty)"
+            text = (
+                "🔔 <b>Tin nhắn lạ</b>\n"
+                f"👤 {display_name} {display_username}\n"
+                f"🆔 ID: <code>{uid_safe}</code>\n"
+                f"💬 \"{preview_safe}\""
+            )
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Allow", callback_data=f"pa:a:{uid_str}"),
+                    InlineKeyboardButton("⏱ Once", callback_data=f"pa:o:{uid_str}"),
+                ],
+                [
+                    InlineKeyboardButton("❌ Deny", callback_data=f"pa:d:{uid_str}"),
+                    InlineKeyboardButton("🔇 Block", callback_data=f"pa:b:{uid_str}"),
+                ],
+            ])
+            msg = await self._bot.send_message(
+                chat_id=owner_chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as exc:
+            logger.warning("[%s] send_owner_approval_request failed: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -1809,6 +1893,126 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    async def _handle_owner_approval_callback(self, query, data: str) -> None:
+        """Resolve a pa:action:user_id button click on the owner-approval prompt.
+
+        Actions:
+          a → approve forever (pairing store)
+          o → approve once (in-memory session set)
+          d → deny (no-op + counter; auto-block when threshold reached)
+          b → block forever (denylist file)
+
+        Caller must be the configured owner (Telegram user id ==
+        ``owner_chat_id``) — required to prevent third-party hijack of an
+        approval prompt that was forwarded or shared.
+        """
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid approval data.")
+            return
+        action, target_uid = parts[1], parts[2]
+
+        owner_chat_id = self._resolve_owner_chat_id()
+        caller_id = getattr(query.from_user, "id", None)
+        if owner_chat_id is None or caller_id != owner_chat_id:
+            await query.answer(text="⛔ Only the bot owner can use these buttons.")
+            return
+
+        try:
+            from gateway.owner_approval import OwnerApprovalRateLimiter
+            limiter = OwnerApprovalRateLimiter("telegram")
+        except Exception as exc:
+            logger.warning("[%s] owner-approval limiter init failed: %s", self.name, exc)
+            limiter = None
+
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if action == "a":  # Allow forever
+            try:
+                runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+                pairing_store = getattr(runner, "pairing_store", None)
+                if pairing_store is not None:
+                    with pairing_store._lock:
+                        pairing_store._approve_user(
+                            "telegram", str(target_uid),
+                            "approved by owner via inline button",
+                        )
+                if limiter is not None:
+                    limiter.reset_deny(target_uid)
+                # Drop any prior block on this user
+                if limiter is not None:
+                    limiter.unblock(target_uid)
+                self._session_allowed_users.discard(str(target_uid))
+                await query.answer(text="✅ Approved")
+                try:
+                    await query.edit_message_text(
+                        text=f"✅ Đã duyệt user <code>{_html.escape(str(target_uid))}</code> at {ts}",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.error("[%s] approve-forever failed: %s", self.name, exc)
+                await query.answer(text="Failed to approve.")
+            return
+
+        if action == "o":  # Allow once (session-only)
+            self._session_allowed_users.add(str(target_uid))
+            await query.answer(text="⏱ Allowed for this session")
+            try:
+                await query.edit_message_text(
+                    text=f"⏱ Once-allowed user <code>{_html.escape(str(target_uid))}</code> at {ts}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "d":  # Deny (no-op, but track counter)
+            count = limiter.record_deny(target_uid) if limiter is not None else 0
+            auto_block = (
+                limiter is not None
+                and limiter.auto_block_after_deny > 0
+                and count >= limiter.auto_block_after_deny
+            )
+            if auto_block:
+                limiter.block(target_uid, blocked_by=str(owner_chat_id))
+                msg = (
+                    f"❌ Denied (auto-blocked after {count} denies) "
+                    f"<code>{_html.escape(str(target_uid))}</code> at {ts}"
+                )
+            else:
+                msg = (
+                    f"❌ Denied <code>{_html.escape(str(target_uid))}</code> "
+                    f"({count} total) at {ts}"
+                )
+            await query.answer(text="❌ Denied")
+            try:
+                await query.edit_message_text(text=msg, parse_mode=ParseMode.HTML, reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        if action == "b":  # Block forever
+            if limiter is not None:
+                limiter.block(target_uid, blocked_by=str(owner_chat_id))
+            self._session_allowed_users.discard(str(target_uid))
+            await query.answer(text="🔇 Blocked")
+            try:
+                await query.edit_message_text(
+                    text=f"🔇 Đã chặn vĩnh viễn <code>{_html.escape(str(target_uid))}</code> at {ts}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        await query.answer(text="Unknown action.")
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -1829,6 +2033,11 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
+            return
+
+        # --- Owner-approval callbacks (pa:action:user_id) ---
+        if data.startswith("pa:"):
+            await self._handle_owner_approval_callback(query, data)
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
