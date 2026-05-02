@@ -2314,6 +2314,195 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await query.answer(text="Unknown action.")
 
+    # ------------------------------------------------------------------
+    # /usage and /usage_today — owner-only token usage report
+    # ------------------------------------------------------------------
+
+    def _is_pairing_approved_caller(self, caller_id: Any) -> bool:
+        """Check if a caller is on the Telegram pairing whitelist."""
+        if caller_id is None:
+            return False
+        try:
+            from gateway.pairing import PairingStore
+            return bool(PairingStore().is_approved("telegram", str(caller_id)))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _today_start_ts() -> float:
+        """Unix timestamp for local-midnight today."""
+        import time
+        now = time.localtime()
+        return time.mktime((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0, 0, 0, -1))
+
+    @staticmethod
+    def _days_ago_ts(days: int) -> float:
+        """Unix timestamp for ``days`` days ago."""
+        import time
+        return time.time() - (days * 86400)
+
+    @staticmethod
+    def _query_token_stats(since_ts: Optional[float]) -> Optional[Dict[str, Any]]:
+        """Aggregate token usage from the SessionDB ``sessions`` table.
+
+        Read-only sqlite connection; ``since_ts=None`` means all-time.
+        Returns dict with totals, sessions count, by_platform and by_user
+        breakdowns, or None when the DB file is missing.
+        """
+        import sqlite3
+        from hermes_constants import get_hermes_home
+        db_path = get_hermes_home() / "state.db"
+        if not db_path.exists():
+            return None
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            where = "started_at >= ?" if since_ts is not None else "1=1"
+            params = (since_ts,) if since_ts is not None else ()
+            row = conn.execute(
+                f"""SELECT
+                    COALESCE(SUM(input_tokens),0) AS input_tokens,
+                    COALESCE(SUM(output_tokens),0) AS output_tokens,
+                    COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
+                    COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens,
+                    COALESCE(SUM(reasoning_tokens),0) AS reasoning_tokens,
+                    COUNT(*) AS sessions
+                    FROM sessions WHERE {where}""",
+                params,
+            ).fetchone()
+            stats: Dict[str, Any] = dict(row) if row else {}
+            stats["total"] = (
+                (stats.get("input_tokens") or 0)
+                + (stats.get("output_tokens") or 0)
+                + (stats.get("cache_read_tokens") or 0)
+                + (stats.get("cache_write_tokens") or 0)
+                + (stats.get("reasoning_tokens") or 0)
+            )
+            by_platform = conn.execute(
+                f"""SELECT source,
+                    COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)
+                        +COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)
+                        +COALESCE(reasoning_tokens,0)),0) AS total,
+                    COUNT(*) AS sessions
+                    FROM sessions WHERE {where}
+                    GROUP BY source ORDER BY total DESC""",
+                params,
+            ).fetchall()
+            stats["by_platform"] = [
+                (r["source"], r["total"], r["sessions"]) for r in by_platform
+            ]
+            by_user = conn.execute(
+                f"""SELECT user_id,
+                    COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)
+                        +COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0)
+                        +COALESCE(reasoning_tokens,0)),0) AS total,
+                    COUNT(*) AS sessions
+                    FROM sessions
+                    WHERE {where} AND user_id IS NOT NULL AND user_id != ''
+                    GROUP BY user_id ORDER BY total DESC LIMIT 5""",
+                params,
+            ).fetchall()
+            stats["by_user"] = [
+                (r["user_id"], r["total"], r["sessions"]) for r in by_user
+            ]
+            return stats
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _format_today_block(stats: Optional[Dict[str, Any]]) -> str:
+        """Render the 'Today' section of the usage report."""
+        if not stats or not stats.get("sessions"):
+            return "⏱ <b>Today</b>\n  <i>(no sessions)</i>"
+        return (
+            "⏱ <b>Today</b>\n"
+            f"  Input: {stats['input_tokens']:,}\n"
+            f"  Output: {stats['output_tokens']:,}\n"
+            f"  Cache R/W: {stats['cache_read_tokens']:,}"
+            f" / {stats['cache_write_tokens']:,}\n"
+            f"  Reasoning: {stats['reasoning_tokens']:,}\n"
+            f"  Total: {stats['total']:,}\n"
+            f"  Sessions: {stats['sessions']}"
+        )
+
+    @classmethod
+    def _format_usage_report(
+        cls,
+        today: Optional[Dict[str, Any]],
+        week: Optional[Dict[str, Any]],
+        all_time: Optional[Dict[str, Any]],
+    ) -> str:
+        """Render the full /usage report (today + 7d + all-time + breakdowns)."""
+        parts = ["📊 <b>Token Usage</b>", "", cls._format_today_block(today), ""]
+        if week and week.get("sessions"):
+            parts.append(
+                f"📅 <b>Last 7 days</b>\n  Total: {week['total']:,}"
+                f" ({week['sessions']} sessions)"
+            )
+        else:
+            parts.append("📅 <b>Last 7 days</b>\n  <i>(no sessions)</i>")
+        parts.append("")
+        if all_time and all_time.get("sessions"):
+            parts.append(
+                f"🌍 <b>All time</b>\n  Total: {all_time['total']:,}"
+                f" ({all_time['sessions']} sessions)"
+            )
+        else:
+            parts.append("🌍 <b>All time</b>\n  <i>(no sessions)</i>")
+        if all_time and all_time.get("by_platform"):
+            total = all_time.get("total") or 0
+            parts.extend(["", "📡 <b>By platform (all time)</b>"])
+            for source, plat_total, _count in all_time["by_platform"]:
+                pct = (plat_total / total) * 100 if total else 0
+                parts.append(
+                    f"  {_html.escape(source or '?')} {pct:.0f}% {plat_total:,}"
+                )
+        if all_time and all_time.get("by_user"):
+            parts.extend(["", "👥 <b>Top users (all time)</b>"])
+            for uid, u_total, u_sessions in all_time["by_user"]:
+                parts.append(
+                    f"  <code>{_html.escape(str(uid))}</code> {u_total:,}"
+                    f" ({u_sessions} sessions)"
+                )
+        return "\n".join(parts)
+
+    async def _send_token_usage_report(
+        self, chat_id: int, today_only: bool = False
+    ) -> None:
+        """Query stats off-thread and send the report to ``chat_id``."""
+        try:
+            today = await asyncio.to_thread(
+                self._query_token_stats, self._today_start_ts()
+            )
+            if today_only:
+                if today and today.get("sessions"):
+                    body = self._format_today_block(today).replace(
+                        "⏱ <b>Today</b>\n", "", 1
+                    )
+                    text = "📊 <b>Token Usage — Today</b>\n" + body
+                else:
+                    text = "📊 <b>Token Usage — Today</b>\n  <i>(no sessions)</i>"
+            else:
+                week = await asyncio.to_thread(
+                    self._query_token_stats, self._days_ago_ts(7)
+                )
+                all_time = await asyncio.to_thread(self._query_token_stats, None)
+                text = self._format_usage_report(today, week, all_time)
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as exc:
+            logger.warning("[%s] /usage failed: %s", self.name, exc)
+            try:
+                await self._bot.send_message(
+                    chat_id=chat_id, text=f"⚠️ Failed to get usage: {exc}"
+                )
+            except Exception:
+                pass
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -3368,6 +3557,30 @@ class TelegramAdapter(BasePlatformAdapter):
             if chat_id is None:
                 return
             await self._send_pairing_manager_menu(int(chat_id), page=0)
+            return
+
+        # /usage and /usage_today — owner-only token tracking. Intercept here
+        # so this Telegram-specific behavior overrides the gateway's default
+        # /usage (which fetches per-session account billing). Strangers fall
+        # through to the regular auth gate (silent ignore for unwhitelisted);
+        # whitelisted non-owners get an explicit owner-only reply.
+        if first in ("/usage", "/usage_today"):
+            caller_id = getattr(update.effective_user, "id", None)
+            chat_id = getattr(update.message, "chat_id", None) or caller_id
+            if chat_id is None:
+                return
+            if self._is_owner_caller(caller_id):
+                await self._send_token_usage_report(
+                    int(chat_id), today_only=(first == "/usage_today")
+                )
+                return
+            if self._is_pairing_approved_caller(caller_id):
+                try:
+                    await self._bot.send_message(
+                        chat_id=int(chat_id), text="⛔ Owner-only command"
+                    )
+                except Exception:
+                    pass
             return
 
         if not self._should_process_message(update.message, is_command=True):
