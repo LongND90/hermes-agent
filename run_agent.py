@@ -8317,6 +8317,14 @@ class AIAgent:
                 guardrail_config=guardrail,
             )
 
+        if self.api_mode == "augment_rest":
+            _at = self._get_transport()
+            return _at.build_kwargs(
+                model=self.model,
+                messages=api_messages,
+                tools=self.tools,
+            )
+
         if self.api_mode == "codex_responses":
             _ct = self._get_transport()
             is_github_responses = (
