@@ -929,6 +929,10 @@ def switch_model(
     if target_provider in {"opencode-zen", "opencode-go", "opencode"}:
         api_mode = opencode_model_api_mode(target_provider, new_model)
 
+    # --- Augment REST api_mode override ---
+    if target_provider == "augment-rest":
+        api_mode = "augment_rest"
+
     # --- Determine api_mode if not already set ---
     if not api_mode:
         api_mode = determine_api_mode(target_provider, base_url)
@@ -1246,7 +1250,7 @@ def list_authenticated_providers(
         if not has_creds:
             continue
 
-        if hermes_slug in {"copilot", "copilot-acp", "auggie-acp"}:
+        if hermes_slug in {"copilot", "copilot-acp", "auggie-acp", "augment-rest"}:
             model_ids = provider_model_ids(hermes_slug)
         # For aws_sdk providers (bedrock), use live discovery so the list
         # reflects the active region (eu.*, ap.*) not the static us.* list.

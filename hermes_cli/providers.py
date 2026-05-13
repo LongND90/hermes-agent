@@ -90,6 +90,13 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="acp://auggie",
         base_url_env_var="AUGGIE_ACP_BASE_URL",
     ),
+    "augment-rest": HermesOverlay(
+        transport="augment_rest",
+        auth_type="api_key",
+        extra_env_vars=("AUGMENT_API_TOKEN", "AUGMENT_API_URL"),
+        base_url_override="augment-rest://chat-stream",
+        base_url_env_var="AUGMENT_API_URL",
+    ),
     "github-copilot": HermesOverlay(
         transport="openai_chat",
         extra_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN"),
@@ -281,6 +288,12 @@ ALIASES: Dict[str, str] = {
     "augment-acp": "auggie-acp",
     "auggie-cli": "auggie-acp",
 
+    # augment-rest (direct HTTP /chat-stream backend)
+    "augmentrest": "augment-rest",
+    "augment_rest": "augment-rest",
+    "augment-http": "augment-rest",
+    "augment-api": "augment-rest",
+
     # vercel (models.dev ID for AI Gateway)
     "ai-gateway": "vercel",
     "aigateway": "vercel",
@@ -366,6 +379,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "openai-codex": "OpenAI Codex",
     "copilot-acp": "GitHub Copilot ACP",
     "auggie-acp": "Auggie ACP",
+    "augment-rest": "Augment REST",
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
     "gmi": "GMI Cloud",
@@ -384,6 +398,7 @@ TRANSPORT_TO_API_MODE: Dict[str, str] = {
     "anthropic_messages": "anthropic_messages",
     "codex_responses": "codex_responses",
     "bedrock_converse": "bedrock_converse",
+    "augment_rest": "augment_rest",
 }
 
 

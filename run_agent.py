@@ -1047,8 +1047,10 @@ class AIAgent:
         self.provider = provider_name or ""
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
-        if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
+        if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "augment_rest"}:
             self.api_mode = api_mode
+        elif self.provider == "augment-rest":
+            self.api_mode = "augment_rest"
         elif self.provider == "openai-codex":
             self.api_mode = "codex_responses"
         elif self.provider == "xai":
@@ -1376,6 +1378,23 @@ class AIAgent:
                     print(f"🤖 AI Agent initialized with model: {self.model} (Anthropic native)")
                     if effective_key and len(effective_key) > 12:
                         print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
+        elif self.api_mode == "augment_rest":
+            # Augment REST — direct HTTP /chat-stream, no OpenAI client.
+            # base_url carries the tenant URL; api_key the session token.
+            from agent.augment_rest_client import AugmentRestClient
+            self.api_key = api_key or ""
+            self.client = AugmentRestClient(
+                api_key=self.api_key,
+                api_url=base_url,
+                model=self.model,
+                timeout=_provider_timeout,
+            )
+            self._client_kwargs = {}
+            if not self.quiet_mode:
+                print(
+                    f"🤖 AI Agent initialized with model: {self.model} "
+                    f"(Augment REST)"
+                )
         elif self.api_mode == "bedrock_converse":
             # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
             # Region is extracted from the base_url or defaults to us-east-1.
@@ -6345,6 +6364,13 @@ class AIAgent:
                     )
                 elif self.api_mode == "anthropic_messages":
                     result["response"] = self._anthropic_messages_create(api_kwargs)
+                elif self.api_mode == "augment_rest":
+                    # AugmentRestClient parses NDJSON internally and returns
+                    # a single response; reuse the shared client (which holds
+                    # the conversation_id) — do not rebuild per request.
+                    aug_kwargs = dict(api_kwargs)
+                    aug_kwargs.pop("stream", None)
+                    result["response"] = self.client.chat.completions.create(**aug_kwargs)
                 elif self.api_mode == "bedrock_converse":
                     # Bedrock uses boto3 directly — no OpenAI client needed.
                     # normalize_converse_response produces an OpenAI-compatible
@@ -6629,6 +6655,12 @@ class AIAgent:
                 return self._interruptible_api_call(api_kwargs)
             finally:
                 self._codex_on_first_delta = None
+
+        if self.api_mode == "augment_rest":
+            # Augment REST parses NDJSON server-side and returns a single
+            # response; there's no incremental delta stream to surface, so
+            # delegate to the non-streaming path.
+            return self._interruptible_api_call(api_kwargs)
 
         # Bedrock Converse uses boto3's converse_stream() with real-time delta
         # callbacks — same UX as Anthropic and chat_completions streaming.

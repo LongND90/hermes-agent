@@ -159,6 +159,10 @@ _PROVIDER_ALIASES = {
     "augment": "auggie-acp",
     "augment-acp": "auggie-acp",
     "auggie-cli": "auggie-acp",
+    "augmentrest": "augment-rest",
+    "augment_rest": "augment-rest",
+    "augment-http": "augment-rest",
+    "augment-api": "augment-rest",
     "tencent": "tencent-tokenhub",
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
@@ -2291,6 +2295,36 @@ def resolve_provider_client(
                 return None, None
             final_model = _normalize_resolved_model(model or default_model, provider)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode else (client, final_model))
+
+        if provider == "augment-rest":
+            creds = resolve_api_key_provider_credentials("augment-rest")
+            api_key = str(creds.get("api_key", "")).strip()
+            tenant_url = str(creds.get("base_url", "")).strip().rstrip("/")
+            if not api_key:
+                logger.warning(
+                    "resolve_provider_client: augment-rest requested but no "
+                    "credentials found (~/.augment/session.json missing and "
+                    "AUGMENT_API_TOKEN unset)"
+                )
+                return None, None
+            from agent.augment_rest_client import (
+                AugmentRestClient,
+                REST_MARKER_BASE_URL,
+            )
+            final_model = _normalize_resolved_model(
+                model or "claude-sonnet-4-5", provider,
+            )
+            if not tenant_url or tenant_url == REST_MARKER_BASE_URL:
+                logger.warning(
+                    "resolve_provider_client: augment-rest tenant URL missing; "
+                    "set AUGMENT_API_URL or run `auggie auth login`."
+                )
+                return None, None
+            client = AugmentRestClient(
+                api_key=api_key, api_url=tenant_url, model=final_model,
+            )
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
 
         creds = resolve_api_key_provider_credentials(provider)
         api_key = str(creds.get("api_key", "")).strip()

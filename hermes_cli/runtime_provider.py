@@ -164,7 +164,7 @@ def _copilot_runtime_api_mode(model_cfg: Dict[str, Any], api_key: str) -> str:
         return "chat_completions"
 
 
-_VALID_API_MODES = {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}
+_VALID_API_MODES = {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "augment_rest"}
 
 
 def _parse_api_mode(raw: Any) -> Optional[str]:
@@ -1132,6 +1132,50 @@ def resolve_runtime_provider(
             "source": creds.get("source", "process"),
             "requested_provider": requested_provider,
         }
+
+    if provider == "augment-rest":
+        from hermes_cli.auth import DEFAULT_AUGMENT_REST_BASE_URL
+
+        try:
+            creds = resolve_api_key_provider_credentials("augment-rest")
+        except AuthError:
+            if requested_provider != "auto":
+                raise
+            creds = {}
+        api_key = creds.get("api_key", "")
+        tenant_url = creds.get("base_url", "").rstrip("/")
+        if not api_key:
+            if requested_provider == "auto":
+                logger.info("augment-rest credentials missing; falling through.")
+            else:
+                raise AuthError(
+                    "augment-rest: no credentials found. Set AUGMENT_API_TOKEN "
+                    "or run `auggie auth login` to create ~/.augment/session.json.",
+                    provider="augment-rest",
+                    code="missing_credentials",
+                )
+        if api_key and (not tenant_url or tenant_url == DEFAULT_AUGMENT_REST_BASE_URL):
+            if requested_provider == "auto":
+                logger.info("augment-rest tenant URL missing; falling through.")
+                api_key = ""
+            else:
+                raise AuthError(
+                    "augment-rest: tenant URL missing. Set AUGMENT_API_URL or "
+                    "run `auggie auth login` to populate ~/.augment/session.json.",
+                    provider="augment-rest",
+                    code="missing_tenant_url",
+                )
+        if api_key:
+            # base_url carries the real tenant URL so transport can reach it.
+            # Display layers must redact when surfacing this to logs / status.
+            return {
+                "provider": "augment-rest",
+                "api_mode": "augment_rest",
+                "base_url": tenant_url,
+                "api_key": api_key,
+                "source": creds.get("source", "augment_session"),
+                "requested_provider": requested_provider,
+            }
 
     # Anthropic (native Messages API)
     if provider == "anthropic":

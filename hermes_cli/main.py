@@ -1815,6 +1815,8 @@ def select_provider_and_model(args=None):
         _model_flow_copilot_acp(config, current_model)
     elif selected_provider == "auggie-acp":
         _model_flow_auggie_acp(config, current_model)
+    elif selected_provider == "augment-rest":
+        _model_flow_augment_rest(config, current_model)
     elif selected_provider == "copilot":
         _model_flow_copilot(config, current_model)
     elif selected_provider == "custom":
@@ -4013,6 +4015,75 @@ def _model_flow_auggie_acp(config, current_model=""):
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
 
+
+def _model_flow_augment_rest(config, current_model=""):
+    """Augment REST flow — direct HTTP /chat-stream.
+
+    Loads credentials from ``~/.augment/session.json`` (or the
+    ``AUGMENT_API_TOKEN`` + ``AUGMENT_API_URL`` env vars) and lets the user
+    pick a Claude model.  Mirrors the auggie-acp flow but selects a real
+    model id since the REST path supports model selection.
+    """
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
+        deactivate_provider,
+        resolve_api_key_provider_credentials,
+    )
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.models import _PROVIDER_MODELS
+
+    del config
+
+    provider_id = "augment-rest"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+
+    try:
+        creds = resolve_api_key_provider_credentials(provider_id)
+    except Exception as exc:
+        print(f"  ⚠ {exc}")
+        creds = {}
+
+    api_key = creds.get("api_key", "")
+    tenant_url = creds.get("base_url", "")
+    if not api_key:
+        print(
+            "  Augment REST requires a session token. Run `auggie auth login` "
+            "or set AUGMENT_API_TOKEN to use this provider."
+        )
+        return
+    if not tenant_url or tenant_url == pconfig.inference_base_url:
+        print(
+            "  Augment REST requires the tenant URL. Set AUGMENT_API_URL or "
+            "let `auggie auth login` populate ~/.augment/session.json."
+        )
+        return
+
+    print(f"  Augment REST — direct HTTPS POST to {tenant_url}/chat-stream")
+    print(f"  Token source: {creds.get('source', 'augment_session')}")
+    print()
+
+    models = list(_PROVIDER_MODELS.get(provider_id, []))
+    selected = _prompt_model_selection(models, current_model or models[0])
+    if not selected:
+        print("  No model selected.")
+        return
+
+    _save_model_choice(selected)
+
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = tenant_url
+    model["api_mode"] = "augment_rest"
+    save_config(cfg)
+    deactivate_provider()
+
+    print(f"Default model set to: {selected} (via {pconfig.name})")
 
 
 def _model_flow_kimi(config, current_model=""):

@@ -84,6 +84,8 @@ DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
 DEFAULT_AUGGIE_ACP_BASE_URL = "acp://auggie"
+DEFAULT_AUGMENT_REST_BASE_URL = "augment-rest://chat-stream"
+AUGMENT_SESSION_PATH = "~/.augment/session.json"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -204,6 +206,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_AUGGIE_ACP_BASE_URL,
         base_url_env_var="AUGGIE_ACP_BASE_URL",
+    ),
+    "augment-rest": ProviderConfig(
+        id="augment-rest",
+        name="Augment REST",
+        auth_type="api_key",
+        inference_base_url=DEFAULT_AUGMENT_REST_BASE_URL,
+        api_key_env_vars=("AUGMENT_API_TOKEN",),
+        base_url_env_var="AUGMENT_API_URL",
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -547,6 +557,32 @@ def _resolve_api_key_provider_secret(
         pass
 
     return "", ""
+
+
+# =============================================================================
+# Augment REST session.json loader
+# =============================================================================
+
+def _load_augment_session_creds() -> Dict[str, str]:
+    """Load Augment REST credentials from ``~/.augment/session.json``.
+
+    Returns a dict with ``api_key`` and ``base_url`` (the tenant URL).  Both
+    fields are empty strings when the file is missing or malformed.  The
+    secret value is never logged.
+    """
+    path = Path(os.path.expanduser(AUGMENT_SESSION_PATH))
+    if not path.is_file():
+        return {"api_key": "", "base_url": ""}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.debug("augment-rest: session.json present but unreadable")
+        return {"api_key": "", "base_url": ""}
+    if not isinstance(data, dict):
+        return {"api_key": "", "base_url": ""}
+    token = str(data.get("accessToken") or "").strip()
+    tenant = str(data.get("tenantURL") or data.get("tenant_url") or "").strip()
+    return {"api_key": token, "base_url": tenant.rstrip("/")}
 
 
 # =============================================================================
@@ -1189,6 +1225,8 @@ def resolve_provider(
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
         "auggie": "auggie-acp", "augment": "auggie-acp",
         "augment-acp": "auggie-acp", "auggie-cli": "auggie-acp",
+        "augmentrest": "augment-rest", "augment_rest": "augment-rest",
+        "augment-http": "augment-rest", "augment-api": "augment-rest",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth", "google-gemini-cli": "google-gemini-cli", "gemini-cli": "google-gemini-cli", "gemini-oauth": "google-gemini-cli",
@@ -3436,8 +3474,22 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
 
+    session_creds: Dict[str, str] = {}
+    if provider_id == "augment-rest" and (not api_key or not env_url):
+        session_creds = _load_augment_session_creds()
+        if not api_key and session_creds.get("api_key"):
+            api_key = session_creds["api_key"]
+            key_source = "augment_session"
+
     if provider_id in ("kimi-coding", "kimi-coding-cn"):
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
+    elif provider_id == "augment-rest":
+        if env_url:
+            base_url = env_url
+        elif session_creds.get("base_url"):
+            base_url = session_creds["base_url"]
+        else:
+            base_url = pconfig.inference_base_url
     elif env_url:
         base_url = env_url
     else:
@@ -3574,10 +3626,24 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
 
+    session_creds: Dict[str, str] = {}
+    if provider_id == "augment-rest" and (not api_key or not env_url):
+        session_creds = _load_augment_session_creds()
+        if not api_key and session_creds.get("api_key"):
+            api_key = session_creds["api_key"]
+            key_source = "augment_session"
+
     if provider_id in ("kimi-coding", "kimi-coding-cn"):
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
     elif provider_id == "zai":
         base_url = _resolve_zai_base_url(api_key, pconfig.inference_base_url, env_url)
+    elif provider_id == "augment-rest":
+        if env_url:
+            base_url = env_url.rstrip("/")
+        elif session_creds.get("base_url"):
+            base_url = session_creds["base_url"]
+        else:
+            base_url = pconfig.inference_base_url
     elif env_url:
         base_url = env_url.rstrip("/")
     else:
