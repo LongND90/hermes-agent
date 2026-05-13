@@ -135,8 +135,15 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
+    GATEWAY_TOOL_FIRST_GUIDANCE,
     build_nous_subscription_prompt,
 )
+
+# Platforms that should NOT receive the gateway tool-first guidance:
+#   - "" (no platform set) — internal/test agents
+#   - "cli" — interactive terminal; user has shell access already
+#   - "cron" — scheduled run, no user present
+_NON_GATEWAY_PLATFORMS = frozenset({"", "cli", "cron"})
 from agent.model_metadata import (
     fetch_model_metadata,
     estimate_tokens_rough, estimate_messages_tokens_rough, estimate_request_tokens_rough,
@@ -4988,6 +4995,13 @@ class AIAgent:
                     prompt_parts.append(_entry.platform_hint)
             except Exception:
                 pass
+
+        # Gateway tool-first behavior — counter chat-mode bias on messaging
+        # surfaces (Telegram, Discord, Slack, etc.). Skip for CLI (user has
+        # shell access) and cron (no user present). Stable per-session content
+        # so it stays in the cached prefix.
+        if platform_key not in _NON_GATEWAY_PLATFORMS:
+            prompt_parts.append(GATEWAY_TOOL_FIRST_GUIDANCE)
 
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
 

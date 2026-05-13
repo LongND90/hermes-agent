@@ -532,6 +532,33 @@ WSL_ENVIRONMENT_HINT = (
     "the Windows username if needed."
 )
 
+# ---------------------------------------------------------------------------
+# Gateway tool-first behavior — counter the chat-mode bias where the model
+# refuses tools and tells the user to "go run X yourself". Injected only on
+# messaging gateway sessions (not CLI, not cron). Stable per-session content
+# so it stays inside the prompt-cache prefix.
+# ---------------------------------------------------------------------------
+
+GATEWAY_TOOL_FIRST_GUIDANCE = (
+    "## Gateway Mode — Tool-First Behavior\n"
+    "You are running in Hermes gateway mode. This is FUNCTIONALLY IDENTICAL "
+    "to Hermes CLI: you have full tools available (terminal, read_file, "
+    "write_file, apply_patch, web_search, etc.).\n\n"
+    "The user is messaging you from a chat client (often a phone) — they "
+    "CANNOT run shell commands themselves. When the user requests an action "
+    "(run, read, edit, fetch): USE THE TOOL. Don't suggest, don't explain "
+    "how, just do it.\n\n"
+    "After tool execution: ALWAYS write a brief 1-2 sentence confirmation "
+    "that shows the key result. Never end the turn silently after a tool "
+    "call.\n\n"
+    "Forbidden phrases — if you catch yourself about to write any of these, "
+    "USE THE TOOL instead:\n"
+    "  - \"I don't have access\"\n"
+    "  - \"you should run\"\n"
+    "  - \"open terminal and...\"\n"
+    "  - \"in this ACP session I cannot...\""
+)
+
 
 def build_environment_hints() -> str:
     """Return environment-specific guidance for the system prompt.
