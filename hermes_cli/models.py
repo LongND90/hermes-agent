@@ -189,11 +189,17 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # Native OpenAI Chat Completions (api.openai.com). Used by /model counts and
     # provider_model_ids fallback when /v1/models is unavailable.
     "openai": [
+        "gpt-5.5",
+        "gpt-5.5-2026-04-23",
         "gpt-5.4",
+        "gpt-5.4-2026-03-05",
         "gpt-5.4-mini",
-        "gpt-5-mini",
+        "gpt-5.4-mini-2026-03-17",
         "gpt-5.3-codex",
         "gpt-5.2-codex",
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-5-nano",
         "gpt-4.1",
         "gpt-4o",
         "gpt-4o-mini",
@@ -226,9 +232,14 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "gemini": [
         "gemini-3.1-pro-preview",
-        "gemini-3-pro-preview",
-        "gemini-3-flash-preview",
         "gemini-3.1-flash-lite-preview",
+        "gemini-3.1-flash-image-preview",
+        "gemini-3-pro-preview",
+        "gemini-3-pro-image-preview",
+        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
     ],
     "google-gemini-cli": [
         "gemini-3.1-pro-preview",
@@ -317,7 +328,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-opus-4-6",
         "claude-opus-4-5",
         "claude-opus-4-1",
+        "claude-sonnet-4-6",
         "claude-sonnet-4-5",
+        "claude-haiku-4-5-20251001",
         "claude-haiku-4-5",
     ],
     "deepseek": [
