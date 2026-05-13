@@ -313,9 +313,12 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-haiku-4-5-20251001",
     ],
     "augment-rest": [
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-opus-4-5",
+        "claude-opus-4-1",
         "claude-sonnet-4-5",
         "claude-haiku-4-5",
-        "claude-opus-4-1",
     ],
     "deepseek": [
         "deepseek-v4-pro",
