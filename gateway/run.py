@@ -533,12 +533,20 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
-def _resolve_runtime_agent_kwargs() -> dict:
+def _resolve_runtime_agent_kwargs(
+    platform: str | None = None,
+    config: dict | None = None,
+) -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
     If the primary provider fails with an authentication error, attempt to
     resolve credentials using the fallback provider chain from config.yaml
     before giving up.
+
+    Provider precedence (first non-empty wins):
+      1. ``gateway.<platform>.provider`` — per-platform override
+      2. ``model.provider`` — top-level config
+      3. ``HERMES_INFERENCE_PROVIDER`` env var — preserved legacy fallback
     """
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
@@ -546,9 +554,28 @@ def _resolve_runtime_agent_kwargs() -> dict:
     )
     from hermes_cli.auth import AuthError
 
+    requested_provider: str | None = None
+    if platform:
+        cfg = config if config is not None else _load_gateway_config()
+        gateway_cfg = cfg.get("gateway", {}) if isinstance(cfg, dict) else {}
+        if isinstance(gateway_cfg, dict):
+            platform_cfg = gateway_cfg.get(platform)
+            if isinstance(platform_cfg, dict):
+                override = platform_cfg.get("provider")
+                if override:
+                    requested_provider = str(override)
+        if not requested_provider:
+            model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            if isinstance(model_cfg, dict):
+                cfg_provider = model_cfg.get("provider")
+                if cfg_provider:
+                    requested_provider = str(cfg_provider)
+    if not requested_provider:
+        requested_provider = os.getenv("HERMES_INFERENCE_PROVIDER")
+
     try:
         runtime = resolve_runtime_provider(
-            requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+            requested=requested_provider,
         )
     except AuthError as auth_exc:
         # Primary provider auth failed (expired token, revoked key, etc.).
@@ -755,14 +782,28 @@ def _load_gateway_config() -> dict:
     return {}
 
 
-def _resolve_gateway_model(config: dict | None = None) -> str:
+def _resolve_gateway_model(config: dict | None = None, platform: str | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
     Without this, temporary AIAgent instances (e.g. /compress) fall
     back to the hardcoded default which fails when the active provider is
     openai-codex.
+
+    When *platform* is provided (e.g. ``"telegram"``), check
+    ``gateway.<platform>.model`` first so users can pin a different model
+    per messaging platform.  Falls back to ``model.default`` (or
+    ``model.model``) when the override is absent.  Unknown/empty platforms
+    skip the override lookup and behave exactly as before.
     """
     cfg = config if config is not None else _load_gateway_config()
+    if platform:
+        gateway_cfg = cfg.get("gateway", {})
+        if isinstance(gateway_cfg, dict):
+            platform_cfg = gateway_cfg.get(platform)
+            if isinstance(platform_cfg, dict):
+                override = platform_cfg.get("model")
+                if override:
+                    return override
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
         return model_cfg
@@ -1350,7 +1391,14 @@ class GatewayRunner:
             except Exception:
                 resolved_session_key = None
 
-        model = _resolve_gateway_model(user_config)
+        platform_name: str | None = None
+        if source is not None:
+            try:
+                platform_name = source.platform.value if source.platform else None
+            except Exception:
+                platform_name = None
+
+        model = _resolve_gateway_model(user_config, platform=platform_name)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -1380,7 +1428,25 @@ class GatewayRunner:
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        # Only thread platform/config when a per-platform provider override is
+        # actually configured.  This keeps existing test monkeypatches that
+        # mock _resolve_runtime_agent_kwargs as ``lambda: {...}`` working in
+        # the common case (no override set) — the new kwargs are only passed
+        # when they have a meaningful effect.
+        _has_provider_override = False
+        if platform_name:
+            _cfg_for_lookup = user_config if user_config is not None else _load_gateway_config()
+            _gw_cfg = _cfg_for_lookup.get("gateway", {}) if isinstance(_cfg_for_lookup, dict) else {}
+            if isinstance(_gw_cfg, dict):
+                _plat_cfg = _gw_cfg.get(platform_name)
+                if isinstance(_plat_cfg, dict) and _plat_cfg.get("provider"):
+                    _has_provider_override = True
+        if _has_provider_override:
+            runtime_kwargs = _resolve_runtime_agent_kwargs(
+                platform=platform_name, config=user_config
+            )
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -6371,7 +6437,9 @@ class GatewayRunner:
                     {
                         "role": "session_meta",
                         "tools": tool_defs or [],
-                        "model": _resolve_gateway_model(),
+                        "model": _resolve_gateway_model(
+                            platform=source.platform.value if source.platform else None
+                        ),
                         "platform": source.platform.value if source.platform else "",
                         "timestamp": ts,
                     }

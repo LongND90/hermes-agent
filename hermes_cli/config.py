@@ -1083,6 +1083,20 @@ DEFAULT_CONFIG = {
         "channel_prompts": {},         # Per-channel ephemeral system prompts
     },
 
+    # Per-platform model/provider overrides for the gateway (optional).
+    # When set, the gateway uses these instead of top-level model.default /
+    # model.provider for that platform.  CLI is unaffected.  Falls back to
+    # model.default / model.provider when a platform key is missing.
+    # Example (commented — leave empty to use defaults):
+    #   gateway:
+    #     telegram:
+    #       model: claude-sonnet-4-5
+    #       provider: augment-rest
+    #     discord:
+    #       model: claude-haiku-4-5
+    #       provider: augment-rest
+    "gateway": {},
+
     # Approval mode for dangerous commands:
     #   manual — always prompt the user (default)
     #   smart  — use auxiliary LLM to auto-approve low-risk commands, prompt for high-risk
