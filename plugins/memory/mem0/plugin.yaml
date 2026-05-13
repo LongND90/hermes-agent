@@ -1,5 +1,8 @@
 name: mem0
-version: 1.0.0
-description: "Mem0 — server-side LLM fact extraction with semantic search, reranking, and automatic deduplication."
+version: 2.0.0
+description: "Mem0 — library mode (default) using Augment LLM + local HuggingFace embeddings + on-disk Qdrant; cloud mode falls back to the Mem0 Platform API."
 pip_dependencies:
   - mem0ai
+  - auggie-sdk
+  - sentence-transformers
+  - qdrant-client

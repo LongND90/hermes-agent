@@ -1,16 +1,18 @@
 """Mem0 memory plugin — MemoryProvider interface.
 
-Server-side LLM fact extraction, semantic search with reranking, and
-automatic deduplication via the Mem0 Platform API.
+Two modes:
 
-Original PR #2933 by kartik-mem0, adapted to MemoryProvider ABC.
+* ``library`` (default) — runs Mem0 in-process using the Augment subscription
+  for fact extraction, local HuggingFace embeddings, and an on-disk Qdrant
+  store at ``$HERMES_HOME/mem0_db``.  Zero per-call cost beyond the existing
+  Augment subscription.
+* ``cloud`` — original Mem0 Platform API path (requires ``MEM0_API_KEY``).
 
-Config via environment variables:
-  MEM0_API_KEY       — Mem0 Platform API key (required)
+Config keys (env or ``$HERMES_HOME/mem0.json``):
+  MEM0_MODE          — ``library`` (default) or ``cloud``
+  MEM0_API_KEY       — Mem0 Platform API key (cloud mode only)
   MEM0_USER_ID       — User identifier (default: hermes-user)
   MEM0_AGENT_ID      — Agent identifier (default: hermes)
-
-Or via $HERMES_HOME/mem0.json.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ def _load_config() -> dict:
     from hermes_constants import get_hermes_home
 
     config = {
+        "mode": os.environ.get("MEM0_MODE", "library"),
         "api_key": os.environ.get("MEM0_API_KEY", ""),
         "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
@@ -64,6 +67,68 @@ def _load_config() -> dict:
             pass
 
     return config
+
+
+# ---------------------------------------------------------------------------
+# Library-mode bootstrap (Mem0 in-process)
+# ---------------------------------------------------------------------------
+
+_LIBRARY_PATCHED = False
+_LIBRARY_PATCH_LOCK = threading.Lock()
+
+
+def _patch_mem0_for_custom_llm() -> None:
+    """Register the Augment LLM with mem0 and relax its provider validators.
+
+    Mem0 hard-codes an allow-list of LLM providers in ``LlmConfig``; we clear
+    that field-validator once at runtime and register our class with the
+    factory so ``provider="augment"`` resolves to ``Mem0AugmentLLM``.
+    """
+    global _LIBRARY_PATCHED
+    with _LIBRARY_PATCH_LOCK:
+        if _LIBRARY_PATCHED:
+            return
+        from mem0.configs.llms.base import BaseLlmConfig
+        from mem0.llms.configs import LlmConfig
+        from mem0.utils.factory import LlmFactory
+
+        LlmFactory.register_provider(
+            "augment",
+            "plugins.memory.mem0.augment_llm.Mem0AugmentLLM",
+            BaseLlmConfig,
+        )
+        LlmConfig.__pydantic_decorators__.field_validators.clear()
+        LlmConfig.model_rebuild(force=True)
+        _LIBRARY_PATCHED = True
+
+
+def _build_library_memory(model_name: str = "sonnet4.5"):
+    """Construct a Mem0 ``Memory`` with Augment LLM + local HF + local Qdrant."""
+    from hermes_constants import get_hermes_home
+    from mem0 import Memory
+
+    _patch_mem0_for_custom_llm()
+    db_path = get_hermes_home() / "mem0_db"
+    db_path.mkdir(parents=True, exist_ok=True)
+    cfg = {
+        "llm": {
+            "provider": "augment",
+            "config": {"model": model_name},
+        },
+        "embedder": {
+            "provider": "huggingface",
+            "config": {"model": "sentence-transformers/all-MiniLM-L6-v2"},
+        },
+        "vector_store": {
+            "provider": "qdrant",
+            "config": {
+                "path": str(db_path),
+                "collection_name": "hermes_memories",
+                "embedding_model_dims": 384,
+            },
+        },
+    }
+    return Memory.from_config(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +188,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._config = None
         self._client = None
         self._client_lock = threading.Lock()
+        self._mode = "library"
         self._api_key = ""
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
@@ -141,6 +207,10 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def is_available(self) -> bool:
         cfg = _load_config()
+        if cfg.get("mode", "library") == "library":
+            # Library mode requires the Augment session file to exist.
+            from pathlib import Path
+            return Path("~/.augment/session.json").expanduser().exists()
         return bool(cfg.get("api_key"))
 
     def save_config(self, values, hermes_home):
@@ -166,16 +236,26 @@ class Mem0MemoryProvider(MemoryProvider):
         ]
 
     def _get_client(self):
-        """Thread-safe client accessor with lazy initialization."""
+        """Thread-safe client accessor with lazy initialization.
+
+        Returns either a Mem0 ``MemoryClient`` (cloud mode) or an in-process
+        ``Memory`` instance (library mode).
+        """
         with self._client_lock:
             if self._client is not None:
                 return self._client
             try:
-                from mem0 import MemoryClient
-                self._client = MemoryClient(api_key=self._api_key)
+                if self._mode == "library":
+                    self._client = _build_library_memory()
+                else:
+                    from mem0 import MemoryClient
+                    self._client = MemoryClient(api_key=self._api_key)
                 return self._client
-            except ImportError:
-                raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
+            except ImportError as exc:
+                raise RuntimeError(
+                    f"mem0 dependencies not installed: {exc}. "
+                    "Run: pip install mem0ai auggie-sdk sentence-transformers qdrant-client"
+                )
 
     def _is_breaker_open(self) -> bool:
         """Return True if the circuit breaker is tripped (too many failures)."""
@@ -202,6 +282,7 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = _load_config()
+        self._mode = (self._config.get("mode") or "library").lower()
         self._api_key = self._config.get("api_key", "")
         # Prefer gateway-provided user_id for per-user memory scoping;
         # fall back to config/env default for CLI (single-user) sessions.
