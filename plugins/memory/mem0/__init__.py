@@ -82,12 +82,16 @@ def _patch_mem0_for_custom_llm() -> None:
 
     Mem0 hard-codes an allow-list of LLM providers in ``LlmConfig``; we clear
     that field-validator once at runtime and register our class with the
-    factory so ``provider="augment"`` resolves to ``Mem0AugmentLLM``.
+    factory so ``provider="augment"`` resolves to ``Mem0AugmentLLM``.  We
+    must also rebuild ``MemoryConfig`` because pydantic v2 bakes the
+    ``LlmConfig`` core schema into its parent at class-build time, so a
+    standalone ``LlmConfig.model_rebuild`` does not propagate.
     """
     global _LIBRARY_PATCHED
     with _LIBRARY_PATCH_LOCK:
         if _LIBRARY_PATCHED:
             return
+        from mem0.configs.base import MemoryConfig
         from mem0.configs.llms.base import BaseLlmConfig
         from mem0.llms.configs import LlmConfig
         from mem0.utils.factory import LlmFactory
@@ -99,10 +103,11 @@ def _patch_mem0_for_custom_llm() -> None:
         )
         LlmConfig.__pydantic_decorators__.field_validators.clear()
         LlmConfig.model_rebuild(force=True)
+        MemoryConfig.model_rebuild(force=True)
         _LIBRARY_PATCHED = True
 
 
-def _build_library_memory(model_name: str = "sonnet4.5"):
+def _build_library_memory(model_name: str = "claude-opus-4-8"):
     """Construct a Mem0 ``Memory`` with Augment LLM + local HF + local Qdrant."""
     from hermes_constants import get_hermes_home
     from mem0 import Memory

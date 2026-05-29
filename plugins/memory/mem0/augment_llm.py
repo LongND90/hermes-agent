@@ -2,7 +2,7 @@
 
 Reads OAuth credentials from ``~/.augment/session.json`` (no env vars
 required) and routes mem0 fact-extraction calls through an Auggie agent
-configured for ``sonnet4.5``.
+configured for ``claude-opus-4-8``.
 
 Mem0 invokes ``generate_response`` in two shapes:
 - Fact extraction: ``response_format={"type": "json_object"}`` — returns a
@@ -73,10 +73,10 @@ class Mem0AugmentLLM(LLMBase):
         super().__init__(config)
         self._agent = None
         self._agent_lock = threading.Lock()
-        self._model_name = (getattr(self.config, "model", None) or "sonnet4.5")
+        self._model_name = (getattr(self.config, "model", None) or "claude-opus-4-8")
 
     def _validate_config(self):
-        # No model attribute is fine — we default to sonnet4.5 ourselves.
+        # No model attribute is fine — we default to claude-opus-4-8 ourselves.
         return
 
     def _get_agent(self):
