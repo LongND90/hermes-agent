@@ -1604,15 +1604,23 @@ def get_model_context_length(
                     if provider != "lmstudio":
                         save_context_length(model, base_url, local_ctx)
                     return local_ctx
-            # Before giving up, consult the static defaults.  Sentinel base
-            # URLs (e.g. "augment-rest://chat-stream") never expose /models
-            # but route to known model families like claude-opus-4-8 (1M).
-            model_lower = model.lower()
-            for default_model, length in sorted(
-                DEFAULT_CONTEXT_LENGTHS.items(), key=lambda x: len(x[0]), reverse=True
-            ):
-                if default_model in model_lower:
-                    return length
+            # Before giving up, consult the static defaults — but ONLY for
+            # sentinel base URLs (e.g. "augment-rest://chat-stream", "acp://")
+            # which never expose /models and route to known model families.
+            # Real HTTP custom endpoints (chutes, openrouter, deepinfra, ...)
+            # must skip this and fall through to CONTEXT_PROBE_TIERS so the
+            # probe-down logic can negotiate the actual limit.
+            if base_url and "://" in base_url:
+                scheme = base_url.split("://", 1)[0].lower()
+                if scheme not in {"http", "https"}:
+                    model_lower = model.lower()
+                    for default_model, length in sorted(
+                        DEFAULT_CONTEXT_LENGTHS.items(),
+                        key=lambda x: len(x[0]),
+                        reverse=True,
+                    ):
+                        if default_model in model_lower:
+                            return length
             logger.info(
                 "Could not detect context length for model %r at %s — "
                 "defaulting to %s tokens (probe-down). Set model.context_length "
