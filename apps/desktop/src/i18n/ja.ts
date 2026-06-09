@@ -215,7 +215,8 @@ export const ja = defineLocale({
       technical: 'テクニカル',
       technicalDesc: '生のツール引数、結果、低レベルの詳細を含めます。',
       themeTitle: 'テーマ',
-      themeDesc: 'デスクトップ専用のパレットです。選択したモードの上に適用されます。'
+      themeDesc: 'デスクトップ専用のパレットです。選択したモードの上に適用されます。',
+      themeProfileNote: profile => `「${profile}」プロファイルに保存されます。プロファイルごとに個別のテーマを保持します。`
     },
     fieldLabels: defineFieldCopy({
       model: 'デフォルトモデル',
@@ -1223,6 +1224,7 @@ export const ja = defineLocale({
       sessionRunning: 'セッション実行中',
       needsInput: '入力が必要です',
       waitingForAnswer: '回答を待っています',
+      handoffOrigin: platform => `${platform} から引き継ぎ`,
       renamed: '名前を変更しました',
       renameFailed: '名前の変更に失敗しました',
       renameTitle: 'セッションの名前を変更',

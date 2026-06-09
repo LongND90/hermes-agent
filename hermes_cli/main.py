@@ -1825,6 +1825,11 @@ def _launch_tui(
     import tempfile
 
     env = os.environ.copy()
+    try:
+        from hermes_cli.config import apply_terminal_config_to_env
+        apply_terminal_config_to_env(env=env)
+    except Exception:
+        logger.debug("Failed to apply terminal config bridge for TUI launch", exc_info=True)
     active_session_fd, active_session_file = tempfile.mkstemp(
         prefix="hermes-tui-active-session-", suffix=".json"
     )
@@ -5095,6 +5100,79 @@ def _purge_electron_build_cache(desktop_dir: Path) -> list[Path]:
     return removed
 
 
+def _stop_desktop_processes_locking_build(desktop_dir: Path) -> list[int]:
+    """Terminate any running desktop app executing from this build's ``release``
+    dir so a rebuild can replace its (otherwise locked) executable.
+
+    On Windows a running ``Hermes.exe`` keeps an exclusive lock on
+    ``release/win-unpacked/Hermes.exe``. electron-builder's pack then can't
+    delete the stale binary and dies with ``remove …\\Hermes.exe: Access is
+    denied`` / ``ERR_ELECTRON_BUILDER_CANNOT_EXECUTE`` (before-pack hits the same
+    EPERM cleaning the dir). The retry path repeats the failure because the lock
+    is still held. POSIX lets you unlink a running binary, so this is a no-op
+    off-Windows.
+
+    Scope is deliberately narrow: only processes whose executable lives *inside*
+    this desktop's ``release`` tree are stopped — a packaged install elsewhere or
+    an unrelated "Hermes" process is never touched. Best-effort: never raises.
+    Returns the PIDs we asked to stop.
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        import psutil
+    except Exception:
+        return []
+    try:
+        release_dir = (desktop_dir / "release").resolve()
+    except OSError:
+        return []
+    if not release_dir.is_dir():
+        return []
+
+    me = os.getpid()
+    victims = []
+    try:
+        proc_iter = psutil.process_iter(["pid", "exe"])
+    except Exception:
+        return []
+    for proc in proc_iter:
+        try:
+            info = proc.info
+        except Exception:
+            continue
+        pid = info.get("pid")
+        exe = info.get("exe")
+        if not exe or pid is None or pid == me:
+            continue
+        try:
+            exe_path = Path(exe).resolve()
+        except (OSError, ValueError):
+            continue
+        if release_dir in exe_path.parents:
+            victims.append(proc)
+
+    stopped: list[int] = []
+    for proc in victims:
+        try:
+            proc.terminate()
+            stopped.append(int(proc.pid))
+        except Exception:
+            continue
+    if stopped:
+        # Wait for the handles (and thus the file locks) to actually release.
+        try:
+            _, alive = psutil.wait_procs(victims, timeout=5)
+            for proc in alive:
+                try:
+                    proc.kill()
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return stopped
+
+
 def _desktop_macos_relaunchable_fixup(desktop_dir: Path) -> None:
     """Make a locally-built (unsigned) macOS desktop app survive in-place self-update.
 
@@ -5251,6 +5329,15 @@ def cmd_gui(args: argparse.Namespace):
             build_label = "source build" if source_mode else "packaged app"
             print(f"→ Building desktop {build_label}...")
             build_script = "build" if source_mode else "pack"
+            if not source_mode:
+                # A running desktop instance launched from release/win-unpacked
+                # holds Hermes.exe locked on Windows, so the pack can't replace
+                # it ("Access is denied" / ERR_ELECTRON_BUILDER_CANNOT_EXECUTE).
+                # Stop it first so the rebuild — including the installer's
+                # headless --update rebuild — succeeds instead of failing cryptically.
+                stopped = _stop_desktop_processes_locking_build(desktop_dir)
+                if stopped:
+                    print(f"  ⚠ Stopped running desktop app to free the build output (pid {', '.join(map(str, stopped))})")
             build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=env, check=False)
             if build_result.returncode != 0 and not source_mode:
                 # A corrupt cached Electron zip makes `pack` fail with an ENOENT
@@ -5271,10 +5358,16 @@ def cmd_gui(args: argparse.Namespace):
                     print("  ⚠ Desktop build failed; cleared cached Electron download and retrying once...")
                     for p in purged:
                         print(f"    - {p}")
+                    # The purge can't remove a win-unpacked tree whose Hermes.exe
+                    # is still locked by a running instance; stop it before retry.
+                    _stop_desktop_processes_locking_build(desktop_dir)
                     build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=env, check=False)
             if build_result.returncode != 0:
                 print("✗ Desktop GUI build failed")
                 print(f"  Run manually:  cd apps/desktop && npm run {build_script}")
+                if sys.platform == "win32":
+                    print("  If this says \"Access is denied\" on Hermes.exe, close any")
+                    print("  running Hermes desktop window and retry.")
                 sys.exit(build_result.returncode or 1)
             packaged_executable = _desktop_packaged_executable(desktop_dir)
             if not source_mode:
@@ -5854,6 +5947,16 @@ def _update_via_zip(args):
     except Exception:
         pass
 
+    # Seed the model-catalog disk cache from the freshly-unpacked checkout
+    # (same rationale as the git-pull path in _cmd_update_impl). Non-fatal.
+    try:
+        from hermes_cli.model_catalog import seed_cache_from_checkout
+
+        if seed_cache_from_checkout(PROJECT_ROOT):
+            print("  ✓ Model catalog cache refreshed from checkout")
+    except Exception as e:
+        logger.debug("Model catalog seed during zip update failed: %s", e)
+
     print()
     print("✓ Update complete!")
     try:
@@ -6272,12 +6375,14 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             _mark_skip_upstream_prompt()
             return
 
-    # Fetch upstream
+    # Fetch upstream main only. This sync compares upstream/main with
+    # origin/main, so there's no reason to pull every upstream ref — and a bare
+    # fetch drags in thousands of auto-generated branches.
     print()
     print("→ Fetching upstream...")
     try:
         subprocess.run(
-            git_cmd + ["fetch", "upstream", "--quiet"],
+            git_cmd + ["fetch", "upstream", "main", "--quiet"],
             cwd=cwd,
             capture_output=True,
             check=True,
@@ -7512,14 +7617,16 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
-    # Fetch both origin and upstream; prefer upstream as the canonical reference.
+    # Fetch only the branch we compare against; prefer upstream as the canonical
+    # reference. A bare `git fetch <remote>` pulls every ref, and this repo has
+    # thousands of auto-generated branches, so scope the fetch to <branch>.
     # Note: upstream/<branch> may not exist for non-main branches (a fork's
     # bb/gui has no upstream counterpart), so when the caller picks a
     # non-default branch we skip the upstream probe and use origin directly.
     if branch == "main":
         print("→ Fetching from upstream...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "upstream"],
+            git_cmd + ["fetch", "upstream", branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -7528,7 +7635,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             # Fallback to origin if upstream doesn't exist
             print("→ Fetching from origin...")
             fetch_result = subprocess.run(
-                git_cmd + ["fetch", "origin"],
+                git_cmd + ["fetch", "origin", branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -7542,7 +7649,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         # Non-default branch: compare against origin/<branch> directly.
         print("→ Fetching from origin...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin"],
+            git_cmd + ["fetch", "origin", branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -8050,9 +8157,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Fetch and pull
     try:
 
+        # Resolve the target branch up front so the fetch can be scoped to it.
+        # A bare `git fetch origin` pulls every ref, and this repo carries
+        # thousands of auto-generated branches — an unscoped fetch can stall for
+        # minutes on a non-single-branch checkout. Fetch only what we update
+        # against.
+        branch = _resolve_update_branch(args)
+
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin"],
+            git_cmd + ["fetch", "origin", branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -8083,11 +8197,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
-
-        # Determine the target branch. Default is "main" (the long-standing
-        # CLI behavior); --branch overrides for callers that want to update
-        # against a non-default channel.
-        branch = _resolve_update_branch(args)
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -8406,6 +8515,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print()
         print("✓ Code updated!")
+
+        # Seed the model-catalog disk cache from the freshly-pulled checkout.
+        # The repo ships the canonical catalog at
+        # website/static/api/model-catalog.json, and `git pull` just made it
+        # current — so copy it straight over ~/.hermes/cache/model_catalog.json
+        # instead of waiting on a network fetch (which can be bot-gated or hit a
+        # Portal hiccup). Keeps the model picker's curated/free lists in sync
+        # with the version the user just installed. Non-fatal on failure: the
+        # normal network refresh still applies on the next picker open.
+        try:
+            from hermes_cli.model_catalog import seed_cache_from_checkout
+
+            if seed_cache_from_checkout(PROJECT_ROOT):
+                print("  ✓ Model catalog cache refreshed from checkout")
+        except Exception as e:
+            logger.debug("Model catalog seed during update failed: %s", e)
 
         # After git pull, source files on disk are newer than cached Python
         # modules in this process.  Reload hermes_constants so that any lazy

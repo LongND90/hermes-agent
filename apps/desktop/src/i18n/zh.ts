@@ -287,7 +287,8 @@ export const zh: Translations = {
       technical: '技术',
       technicalDesc: '包含原始工具参数/结果及底层细节。',
       themeTitle: '主题',
-      themeDesc: '仅桌面端调色板。所选模式叠加其上。'
+      themeDesc: '仅桌面端调色板。所选模式叠加其上。',
+      themeProfileNote: profile => `已为「${profile}」配置文件保存——每个配置文件保留各自的主题。`
     },
     fieldLabels: defineFieldCopy({
       model: '默认模型',
@@ -1267,6 +1268,7 @@ export const zh: Translations = {
       sessionRunning: '会话运行中',
       needsInput: '需要你输入',
       waitingForAnswer: '正在等待你的回答',
+      handoffOrigin: platform => `从 ${platform} 转接`,
       renamed: '已重命名',
       renameFailed: '重命名失败',
       renameTitle: '重命名会话',

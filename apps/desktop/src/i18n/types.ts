@@ -219,6 +219,7 @@ export interface Translations {
       technicalDesc: string
       themeTitle: string
       themeDesc: string
+      themeProfileNote: (profile: string) => string
     }
     fieldLabels: Record<string, string>
     fieldDescriptions: Record<string, string>
@@ -837,6 +838,7 @@ export interface Translations {
       sessionRunning: string
       needsInput: string
       waitingForAnswer: string
+      handoffOrigin: (platform: string) => string
       renamed: string
       renameFailed: string
       renameTitle: string
