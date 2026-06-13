@@ -416,8 +416,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
-        # Bot API 10.1 Rich Messages: send final replies via sendRichMessage
-        # with the raw agent markdown so tables/task lists/etc. render natively.
+        # Bot API 10.1 Rich Messages: opportunistically send final replies via
+        # sendRichMessage with the raw agent markdown so tables/task lists/etc.
+        # render natively. Opt-out via platforms.telegram.extra.rich_messages
+        # (default OFF: web.telegram.org cannot render rich entities yet and
+        # shows "This message is currently not supported on Telegram Web").
+        self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
@@ -1030,8 +1034,12 @@ class TelegramAdapter(BasePlatformAdapter):
         return inspect.iscoroutinefunction(getattr(self._bot, "do_api_request", None))
 
     def _should_attempt_rich(self, content: str) -> bool:
+        # getattr defaults: tests build adapters via object.__new__() (no
+        # __init__), so the flags may be unset — default rich OFF (the
+        # feature is opt-in via platforms.telegram.extra.rich_messages).
         return bool(
-            not getattr(self, "_rich_send_disabled", False)
+            getattr(self, "_rich_messages_enabled", False)
+            and not getattr(self, "_rich_send_disabled", False)
             and content
             and content.strip()
             and self._content_fits_rich_limits(content)
@@ -1209,7 +1217,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
         return bool(
-            not getattr(self, "_rich_send_disabled", False)
+            getattr(self, "_rich_messages_enabled", False)
+            and not getattr(self, "_rich_send_disabled", False)
             and not getattr(self, "_rich_draft_disabled", False)
             and content
             and content.strip()
