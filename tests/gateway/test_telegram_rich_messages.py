@@ -47,8 +47,15 @@ PTB_INVALID_TOKEN_404 = InvalidToken(
 
 
 def _make_adapter(extra=None):
-    """Build a TelegramAdapter with a mock bot wired for the rich path."""
-    config = PlatformConfig(enabled=True, token="fake-token", extra=extra or {})
+    """Build a TelegramAdapter with a mock bot wired for the rich path.
+
+    The runtime default for ``rich_messages`` is OFF (owner opt-out policy), so
+    the helper enables it explicitly to exercise the rich path. Callers can still
+    override it (e.g. ``extra={"rich_messages": False}``) for opt-out tests.
+    """
+    config = PlatformConfig(
+        enabled=True, token="fake-token", extra={"rich_messages": True, **(extra or {})}
+    )
     adapter = TelegramAdapter(config)
     bot = MagicMock()
     # do_api_request as an AsyncMock makes inspect.iscoroutinefunction(...) True,
@@ -180,16 +187,24 @@ async def test_rich_messages_opt_out_accepts_string_false():
 
 
 @pytest.mark.asyncio
-async def test_rich_messages_default_is_enabled():
-    adapter = _make_adapter()
+async def test_rich_messages_default_is_disabled():
+    # Owner policy: rich messages are opt-in (default OFF). Build the adapter
+    # WITHOUT the helper's rich injection to exercise the real runtime default.
+    config = PlatformConfig(enabled=True, token="fake-token", extra={})
+    adapter = TelegramAdapter(config)
+    assert adapter._rich_messages_enabled is False
+
+    bot = MagicMock()
+    bot.do_api_request = AsyncMock(return_value=SimpleNamespace(message_id=123))
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+    bot.send_chat_action = AsyncMock()
+    adapter._bot = bot
 
     result = await adapter.send("12345", RICH_CONTENT)
 
     assert result.success is True
-    bot = adapter._bot
-    assert bot is not None
-    bot.do_api_request.assert_awaited_once()
-    bot.send_message.assert_not_called()
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
 
 
 @pytest.mark.asyncio
